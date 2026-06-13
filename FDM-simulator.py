@@ -201,6 +201,10 @@ class ToolpathSegment:
         return start + (end - start) * clamp(progress, 0.0, 1.0)
 
     def partial(self, progress):
+        progress = clamp(progress, 0.0, 1.0)
+        meta = dict(self.meta)
+        meta["partial_progress_start"] = float(meta.get("partial_progress_start", 0.0))
+        meta["partial_progress_end"] = progress
         return ToolpathSegment(
             start=self.start,
             end=tuple(self.point_at(progress)),
@@ -210,7 +214,7 @@ class ToolpathSegment:
             color=self.color,
             risk_weight=self.risk_weight,
             defect_strength=self.defect_strength,
-            meta=dict(self.meta),
+            meta=meta,
         )
 
 
@@ -339,13 +343,13 @@ class PrintSimulationEngine:
         for start, end in zip(corners[:-1], corners[1:]):
             layer.segment_list.append(ToolpathSegment(start, end, width, height, segment_type, color, defect_strength=defect, meta=dict(meta or {})))
 
-    def add_circle_layer(self, layer, cx, cy, z, radius, width=0.24, height=0.12, color="#ff8a3d", points=24, meta=None):
+    def add_circle_layer(self, layer, cx, cy, z, radius, width=0.24, height=0.12, color="#ff8a3d", points=24, meta=None, segment_type="extrusion", start_angle=0.0):
         path = []
         for index in range(points + 1):
-            angle = 2 * math.pi * index / points
+            angle = start_angle + 2 * math.pi * index / points
             path.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle), z))
         for start, end in zip(path[:-1], path[1:]):
-            layer.segment_list.append(ToolpathSegment(start, end, width, height, "extrusion", color, meta=dict(meta or {})))
+            layer.segment_list.append(ToolpathSegment(start, end, width, height, segment_type, color, meta=dict(meta or {})))
 
     def add_infill_lines(self, layer, cx, cy, z, sx, sy, count=2, width=0.28, height=0.14, color="#ff9a4d"):
         for index in range(count):
@@ -385,9 +389,9 @@ class PrintSimulationEngine:
             else:
                 over_index = layer_index - base_layers
                 cx = -1.00 + (over_index + 1) * offset_per_layer
-                sag = risk * max(0, over_index - 1) * 0.030
-                z_visual = z - sag
+                z_visual = z
                 length = 1.80 + over_index * offset_per_layer
+                tip_x = cx + length / 2
                 self.add_rectangle_layer(
                     layer,
                     cx,
@@ -399,7 +403,12 @@ class PrintSimulationEngine:
                     height=height,
                     color="#ff8a3d",
                     defect=risk,
-                    meta={"overhang_risk": risk},
+                    meta={
+                        "overhang_risk": risk,
+                        "overhang_root_x": -0.62,
+                        "overhang_tip_x": tip_x,
+                        "overhang_layer_factor": (over_index + 1) / overhang_layers,
+                    },
                 )
             layers.append(layer)
         return layers
@@ -423,10 +432,18 @@ class PrintSimulationEngine:
                 (-sx / 2, -sy / 2, z),
             ]
             for side_index, (start, end) in enumerate(zip(corners[:-1], corners[1:])):
+                meta = {
+                    "profile": "pressure",
+                    "pa_low": low,
+                    "pa_high": high,
+                    "corner_start": True,
+                    "corner_end": True,
+                    "side_index": side_index,
+                }
                 if high > 0.04:
-                    layer.segment_list.append(ToolpathSegment(start, end, 0.30, height, "extrusion", "#ff8a3d", defect_strength=high, meta={"pa_high": high}))
+                    layer.segment_list.append(ToolpathSegment(start, end, 0.30, height, "extrusion", "#ff8a3d", defect_strength=high, meta=meta))
                 else:
-                    layer.segment_list.append(ToolpathSegment(start, end, 0.30, height, "extrusion", "#ff8a3d", defect_strength=low, meta={"pa_low": low}))
+                    layer.segment_list.append(ToolpathSegment(start, end, 0.30, height, "extrusion", "#ff8a3d", defect_strength=low, meta=meta))
             layers.append(layer)
         return layers
 
@@ -466,18 +483,48 @@ class PrintSimulationEngine:
             z = self.visual_layer_z(layer_index)
             height = self.visual_segment_height()
             layer = ToolpathLayer(z, layer_index)
-            for tower_index, (cx, cy) in enumerate(centers):
-                self.add_circle_layer(layer, cx, cy, z, radius=0.36, width=0.20, height=height, points=22)
-                if gap > 0.06 and tower_index == 1:
-                    layer.segment_list.append(ToolpathSegment((cx - 0.36, cy - 0.10, z + 0.02), (cx - 0.12, cy - 0.10, z + 0.02), 0.07, 0.04, "gap", "#0b1118", defect_strength=gap))
+            self.add_circle_layer(
+                layer,
+                centers[0][0],
+                centers[0][1],
+                z,
+                radius=0.36,
+                width=0.20,
+                height=height,
+                points=24,
+                start_angle=0.0,
+                meta={"tower": "first", "layer_index": layer_index},
+            )
             travel_z = z + 0.24
-            travel = ToolpathSegment((-1.20, 0.0, travel_z), (1.20, 0.0, travel_z), 0.05, 0.03, "travel", "#dfe7ef")
+            travel = ToolpathSegment(
+                (-1.44, 0.0, travel_z),
+                (1.44, 0.0, travel_z),
+                0.05,
+                0.03,
+                "travel",
+                "#dfe7ef",
+                defect_strength=stringing,
+                meta={"stringing_risk": stringing, "layer_index": layer_index},
+            )
             layer.segment_list.append(travel)
-            if stringing > 0.04:
-                count = int(lerp(2, 6, stringing))
-                for index in range(count):
-                    y = lerp(-0.32, 0.32, index / max(count - 1, 1))
-                    layer.segment_list.append(ToolpathSegment((-1.14, y, z + 0.08), (1.14, -y * 0.5, z + 0.065 + 0.06 * stringing), 0.022, 0.016, "stringing", "#f6ead0", defect_strength=stringing))
+            self.add_circle_layer(
+                layer,
+                centers[1][0],
+                centers[1][1],
+                z,
+                radius=0.36,
+                width=0.20,
+                height=height,
+                points=24,
+                start_angle=math.pi,
+                meta={
+                    "tower": "second",
+                    "layer_index": layer_index,
+                    "restart_gap_risk": gap,
+                    "restart_blob_risk": clamp(stringing - 0.22, 0.0, 1.0),
+                    "restart_total_length": 2 * math.pi * 0.36,
+                },
+            )
             layers.append(layer)
         return layers
 
@@ -497,9 +544,9 @@ class PrintSimulationEngine:
                 start_x = -2.8
                 end_x = 2.8
                 if ratio <= 1.0:
-                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height, "extrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk}))
+                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height, "extrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk, "line_index": line_index, "layer_index": layer_index}))
                 else:
-                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height * 0.78, "underextrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk}))
+                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height * 0.78, "underextrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk, "line_index": line_index, "layer_index": layer_index}))
             layers.append(layer)
         return layers
 
@@ -957,6 +1004,168 @@ class GLSceneWidget(QWidget):
             distances.append(distances[-1] + float(np.linalg.norm(np.asarray(end, dtype=float) - np.asarray(start, dtype=float))))
         return distances
 
+    def deterministic_noise(self, index, seed=0):
+        value = math.sin((index + 1) * 12.9898 + (seed + 1) * 78.233) * 43758.5453
+        return value - math.floor(value)
+
+    def generate_bead_samples_along_path(self, run, max_step=0.14):
+        points = []
+        samples = []
+        distance_offset = 0.0
+        for segment_index, segment in enumerate(run):
+            start = np.asarray(segment.start, dtype=float)
+            end = np.asarray(segment.end, dtype=float)
+            length = max(float(np.linalg.norm(end - start)), 0.001)
+            steps = max(1, min(80, int(math.ceil(length / max(max_step, 0.04)))))
+            progress_start = float(segment.meta.get("partial_progress_start", 0.0))
+            progress_end = float(segment.meta.get("partial_progress_end", 1.0))
+            first_step = 0 if not points else 1
+            for step in range(first_step, steps + 1):
+                t = step / steps
+                point = start + (end - start) * t
+                original_t = clamp(progress_start + (progress_end - progress_start) * t, 0.0, 1.0)
+                points.append(point)
+                samples.append(
+                    {
+                        "segment": segment,
+                        "segment_index": segment_index,
+                        "sample_index": len(samples),
+                        "local_progress": original_t,
+                        "visible_progress": t,
+                        "distance": distance_offset + length * t,
+                        "point": point,
+                    }
+                )
+            distance_offset += length
+        return points, samples, max(distance_offset, 0.001)
+
+    def sample_gap_range(self, samples, index, total, scale=0.78):
+        center = samples[index]["distance"]
+        if len(samples) <= 1:
+            half = total * 0.010
+        else:
+            previous_distance = samples[max(0, index - 1)]["distance"]
+            next_distance = samples[min(len(samples) - 1, index + 1)]["distance"]
+            half = max((next_distance - previous_distance) * 0.5 * scale, total * 0.003)
+        return (clamp((center - half) / total, 0.0, 1.0), clamp((center + half) / total, 0.0, 1.0))
+
+    def corner_profile_influence(self, sample, zone=0.18):
+        segment = sample["segment"]
+        local = sample["local_progress"]
+        influence = 0.0
+        if segment.meta.get("corner_start", False):
+            influence = max(influence, smoothstep(1.0 - local / max(zone, 0.01)))
+        if segment.meta.get("corner_end", False):
+            influence = max(influence, smoothstep(1.0 - (1.0 - local) / max(zone, 0.01)))
+        return influence
+
+    def apply_corner_blob_profile(self, modifiers, samples):
+        for index, sample in enumerate(samples):
+            meta = sample["segment"].meta
+            influence = self.corner_profile_influence(sample)
+            if influence <= 0.0:
+                continue
+            low = float(meta.get("pa_low", 0.0))
+            high = float(meta.get("pa_high", 0.0))
+            if low > 0.01:
+                modifiers[index] *= 1.0 + low * influence * 1.20
+            if high > 0.01:
+                modifiers[index] *= max(0.30, 1.0 - high * influence * 0.70)
+        return modifiers
+
+    def apply_underextrusion_profile(self, modifiers, samples):
+        for index, sample in enumerate(samples):
+            segment = sample["segment"]
+            meta = segment.meta
+            ratio = float(meta.get("flow_ratio", 0.0))
+            if ratio <= 0.75 and segment.segment_type != "underextrusion":
+                continue
+            risk = clamp(float(meta.get("flow_risk", segment.defect_strength)), 0.0, 1.0)
+            severity = clamp((ratio - 0.75) / 0.75, 0.0, 1.0)
+            seed = int(meta.get("line_index", 0)) * 37 + int(meta.get("layer_index", 0)) * 19
+            noise = self.deterministic_noise(index, seed)
+            slow_pulse = 0.5 + 0.5 * math.sin(2 * math.pi * (sample["visible_progress"] * 2.7 + noise * 0.33))
+            thinning = severity * (0.10 + 0.22 * noise + 0.12 * slow_pulse) + risk * 0.08
+            modifiers[index] *= max(0.24, 1.0 - thinning)
+        return modifiers
+
+    def apply_restart_profile(self, modifiers, samples, total):
+        if total <= 0:
+            return modifiers
+        for index, sample in enumerate(samples):
+            meta = sample["segment"].meta
+            gap_risk = clamp(float(meta.get("restart_gap_risk", 0.0)), 0.0, 1.0)
+            blob_risk = clamp(float(meta.get("restart_blob_risk", 0.0)), 0.0, 1.0)
+            if gap_risk <= 0.01 and blob_risk <= 0.01:
+                continue
+            profile_total = max(float(meta.get("restart_total_length", total)), 0.001)
+            seam_distance = min(sample["distance"], abs(profile_total - sample["distance"]))
+            influence = smoothstep(1.0 - seam_distance / max(profile_total * 0.13, 0.001))
+            if gap_risk > 0.01:
+                modifiers[index] *= max(0.22, 1.0 - gap_risk * influence * 0.78)
+            if blob_risk > 0.01:
+                modifiers[index] *= 1.0 + blob_risk * influence * 0.55
+        return modifiers
+
+    def apply_width_profile(self, samples, total):
+        modifiers = np.ones(len(samples), dtype=float)
+        modifiers = self.apply_corner_blob_profile(modifiers, samples)
+        modifiers = self.apply_underextrusion_profile(modifiers, samples)
+        modifiers = self.apply_restart_profile(modifiers, samples, total)
+        return np.clip(modifiers, 0.18, 1.95)
+
+    def apply_gap_profile(self, samples, total):
+        gaps = []
+        if total <= 0 or not samples:
+            return gaps
+
+        pressure_gap_added = set()
+        for index, sample in enumerate(samples):
+            segment = sample["segment"]
+            meta = segment.meta
+            high = clamp(float(meta.get("pa_high", 0.0)), 0.0, 1.0)
+            influence = self.corner_profile_influence(sample, zone=0.12)
+            near_start = sample["local_progress"] < 0.055
+            near_end = sample["local_progress"] > 0.945
+            corner_key = (sample["segment_index"], "start" if near_start else "end")
+            if high > 0.68 and influence > 0.72 and (near_start or near_end) and corner_key not in pressure_gap_added:
+                gaps.append(self.sample_gap_range(samples, index, total, 0.58 + high * 0.20))
+                pressure_gap_added.add(corner_key)
+
+            ratio = float(meta.get("flow_ratio", 0.0))
+            if ratio > 1.0:
+                risk = clamp(float(meta.get("flow_risk", segment.defect_strength)), 0.0, 1.0)
+                seed = int(meta.get("line_index", 0)) * 41 + int(meta.get("layer_index", 0)) * 23
+                noise = self.deterministic_noise(index, seed)
+                gap_probability = clamp((ratio - 1.0) * 0.075 + risk * 0.055, 0.0, 0.16)
+                away_from_ends = 0.035 < sample["visible_progress"] < 0.965
+                if away_from_ends and noise < gap_probability:
+                    gaps.append(self.sample_gap_range(samples, index, total, 0.48 + risk * 0.35))
+
+        restart_segments = [sample for sample in samples if float(sample["segment"].meta.get("restart_gap_risk", 0.0)) > 0.14]
+        if restart_segments:
+            gap_risk = max(float(sample["segment"].meta.get("restart_gap_risk", 0.0)) for sample in restart_segments)
+            width = clamp(0.010 + gap_risk * 0.040, 0.012, 0.060)
+            gaps.append((0.0, width))
+            gaps.append((1.0 - width * 0.55, 1.0))
+
+        return gaps
+
+    def apply_z_offset_profile(self, samples):
+        offsets = np.zeros(len(samples), dtype=float)
+        for index, sample in enumerate(samples):
+            meta = sample["segment"].meta
+            risk = clamp(float(meta.get("overhang_risk", 0.0)), 0.0, 1.0)
+            if risk <= 0.01:
+                continue
+            root_x = float(meta.get("overhang_root_x", sample["point"][0]))
+            tip_x = float(meta.get("overhang_tip_x", root_x + 0.001))
+            layer_factor = clamp(float(meta.get("overhang_layer_factor", 1.0)), 0.0, 1.0)
+            free_end_factor = clamp((sample["point"][0] - root_x) / max(tip_x - root_x, 0.001), 0.0, 1.0)
+            max_sag = 0.045 + 0.075 * layer_factor
+            offsets[index] -= risk * (free_end_factor ** 1.55) * max_sag
+        return offsets
+
     def corner_strength(self, previous, current, following):
         previous = np.asarray(previous, dtype=float)
         current = np.asarray(current, dtype=float)
@@ -1292,22 +1501,21 @@ class GLSceneWidget(QWidget):
     def draw_bead_run(self, run):
         if not run:
             return
-        model_points = self.bead_run_points(run)
-        has_flow_marks = any(segment.segment_type == "underextrusion" or float(segment.meta.get("flow_ratio", 0.0)) > 1.0 for segment in run)
-        model_points = self.densify_path_points(model_points, 0.18 if has_flow_marks else 0.28)
-        modifiers, gaps = self.bead_modifiers(model_points, run)
+        has_flow_marks = any(segment.segment_type == "underextrusion" or float(segment.meta.get("flow_ratio", 0.0)) > 0.75 for segment in run)
+        has_pressure_marks = any(segment.meta.get("profile") == "pressure" for segment in run)
+        has_restart_marks = any(float(segment.meta.get("restart_gap_risk", 0.0)) > 0.0 or float(segment.meta.get("restart_blob_risk", 0.0)) > 0.0 for segment in run)
+        max_step = 0.10 if (has_flow_marks or has_pressure_marks or has_restart_marks) else 0.16
+        model_points, samples, total = self.generate_bead_samples_along_path(run, max_step=max_step)
+        if len(model_points) < 2:
+            return
+        modifiers = self.apply_width_profile(samples, total)
+        gaps = self.apply_gap_profile(samples, total)
+        z_offsets = self.apply_z_offset_profile(samples)
+        model_points = [
+            np.asarray(point, dtype=float) + np.asarray((0.0, 0.0, z_offsets[index]), dtype=float)
+            for index, point in enumerate(model_points)
+        ]
         scene_points = [self.scene_point(point) for point in model_points]
-
-        overhang_risk = max(float(segment.meta.get("overhang_risk", 0.0)) for segment in run)
-        if overhang_risk > 0.02:
-            xs = [point[0] for point in model_points]
-            min_x = min(xs)
-            span_x = max(max(xs) - min_x, 0.001)
-            sag_depth = self.scene_height(max(segment.height for segment in run)) * overhang_risk * 0.58
-            scene_points = [
-                point + np.asarray((0.0, 0.0, -sag_depth * smoothstep((model_points[index][0] - min_x) / span_x)), dtype=float)
-                for index, point in enumerate(scene_points)
-            ]
 
         width = float(np.mean([self.scene_width(segment.width) for segment in run]))
         height = float(np.mean([self.scene_height(segment.height) for segment in run]))
@@ -1322,11 +1530,37 @@ class GLSceneWidget(QWidget):
             alpha = 0.88
         self.create_extrusion_bead_mesh(scene_points, width, height, run[0].color, width_modifiers=modifiers, gap_ranges=gaps, alpha=alpha)
 
+    def draw_travel_stringing(self, segment, progress=1.0):
+        risk = clamp(float(segment.meta.get("stringing_risk", 0.0)), 0.0, 1.0)
+        if risk <= 0.04:
+            return
+        count = int(round(lerp(1, 6, risk)))
+        count = max(1, min(6, count))
+        start = np.asarray(segment.start, dtype=float)
+        end = np.asarray(segment.end, dtype=float)
+        layer_seed = int(segment.meta.get("layer_index", 0))
+        for index in range(count):
+            centered = index - (count - 1) / 2
+            y_offset = centered * lerp(0.035, 0.075, risk)
+            start_jitter = (self.deterministic_noise(index, layer_seed) - 0.5) * 0.025
+            end_jitter = (self.deterministic_noise(index + 11, layer_seed) - 0.5) * 0.025
+            sag = lerp(0.015, 0.100, risk) * (0.7 + 0.2 * abs(centered))
+            curve = [
+                start + np.asarray((0.00, y_offset + start_jitter, -0.15), dtype=float),
+                (start + end) * 0.5 + np.asarray((0.0, y_offset * 0.35, -0.20 - sag), dtype=float),
+                end + np.asarray((0.00, y_offset * 0.45 + end_jitter, -0.16), dtype=float),
+            ]
+            partial = partial_polyline3d(curve, progress)
+            if len(partial) >= 2:
+                alpha = 0.18 + risk * 0.42
+                self.add_line([self.scene_point(point) for point in partial], "#f6ead0", 0.62, alpha)
+
     def draw_segment(self, segment, progress=1.0, active=False):
         if segment.segment_type == "travel":
             if active:
                 partial = segment.partial(progress)
                 self.add_line([self.scene_point(partial.start), self.scene_point(partial.end)], "#dfe7ef", 1.0, 0.60)
+            self.draw_travel_stringing(segment, progress if active else 1.0)
             return
         if segment.segment_type == "stringing":
             self.add_line([self.scene_point(segment.start), self.scene_point(segment.end)], segment.color, 0.75, 0.22 + segment.defect_strength * 0.42)
@@ -1360,12 +1594,6 @@ class GLSceneWidget(QWidget):
     def build_static_scene(self):
         self.add_grid()
         self.add_print_bed()
-        if self.state.active_mode == "overhang":
-            fan = float(self.state.current_params().get("fan", 70))
-            fan_alpha = 0.25 + 0.60 * clamp(fan / 100, 0, 1)
-            for idx, y in enumerate([-0.55, 0.0, 0.55]):
-                z = 1.85 - idx * 0.08
-                self.add_line([self.scene_point((4.10, y, z)), self.scene_point((3.10, y * 0.65, z - 0.18))], "#7dd3fc", 1.4, fan_alpha)
 
     def draw_completed_segments(self):
         for item in self.collect_bead_runs(self.engine.completed_segments):
