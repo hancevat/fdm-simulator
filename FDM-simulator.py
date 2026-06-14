@@ -46,7 +46,7 @@ except Exception as exc:  # pragma: no cover - dependency fallback
 
 MODES = [
     ("intro", "Ana Sayfa"),
-    ("overhang", "Overhang / Cooling"),
+    ("overhang", "Bridge / Cooling"),
     ("pressure", "Pressure Advance"),
     ("input", "Input Shaping / Ringing"),
     ("retraction", "Retraction / Stringing"),
@@ -57,7 +57,7 @@ MODE_LABELS = dict(MODES)
 
 DEFAULT_PARAMETERS = {
     "intro": {},
-    "overhang": {"angle": 55, "fan": 70, "speed": 55, "support": False},
+    "overhang": {"angle": 40, "fan": 70, "speed": 55, "support": False},
     "pressure": {"pa": 0.05, "extruder": "Direct Drive", "speed": 80},
     "input": {"acceleration": 3500, "frequency": 45, "shaper": "MZV", "speed": 100},
     "retraction": {"retraction": 1.0, "temperature": 205, "travel_speed": 160, "extruder": "Direct Drive"},
@@ -66,21 +66,21 @@ DEFAULT_PARAMETERS = {
 
 PRESET_PARAMETERS = {
     "PLA": {
-        "overhang": {"angle": 50, "fan": 95, "speed": 55, "support": False},
+        "overhang": {"angle": 30, "fan": 95, "speed": 55, "support": False},
         "pressure": {"pa": 0.05, "extruder": "Direct Drive", "speed": 80},
         "input": {"acceleration": 3500, "frequency": 45, "shaper": "MZV", "speed": 100},
         "retraction": {"retraction": 1.0, "temperature": 205, "travel_speed": 170, "extruder": "Direct Drive"},
         "flow": {"layer_height": 0.20, "line_width": 0.45, "print_speed": 70, "max_flow": 12, "nozzle_diameter": "0.4"},
     },
     "PETG": {
-        "overhang": {"angle": 48, "fan": 45, "speed": 45, "support": False},
+        "overhang": {"angle": 45, "fan": 45, "speed": 45, "support": False},
         "pressure": {"pa": 0.08, "extruder": "Direct Drive", "speed": 70},
         "input": {"acceleration": 3000, "frequency": 42, "shaper": "MZV", "speed": 90},
         "retraction": {"retraction": 1.4, "temperature": 240, "travel_speed": 150, "extruder": "Direct Drive"},
         "flow": {"layer_height": 0.20, "line_width": 0.45, "print_speed": 55, "max_flow": 10, "nozzle_diameter": "0.4"},
     },
     "ABS": {
-        "overhang": {"angle": 45, "fan": 20, "speed": 45, "support": True},
+        "overhang": {"angle": 40, "fan": 20, "speed": 45, "support": True},
         "pressure": {"pa": 0.06, "extruder": "Direct Drive", "speed": 75},
         "input": {"acceleration": 2800, "frequency": 40, "shaper": "EI", "speed": 85},
         "retraction": {"retraction": 1.2, "temperature": 245, "travel_speed": 155, "extruder": "Direct Drive"},
@@ -127,6 +127,44 @@ def ease_in_out(t):
 def smoothstep(value):
     value = clamp(value, 0.0, 1.0)
     return value * value * (3.0 - 2.0 * value)
+
+
+def bridge_scene_config(params):
+    span_mm = float(params.get("angle", 40))
+    fan = float(params.get("fan", 70))
+    speed = float(params.get("speed", 55))
+    support = bool(params.get("support", False))
+
+    span_visual = clamp((span_mm - 10) / 70, 0.0, 1.0)
+    span_factor = clamp((span_mm - 20) / 60, 0.0, 1.0)
+    fan_factor = clamp(1.0 - fan / 100, 0.0, 1.0)
+    speed_factor = clamp((speed - 40) / 80, 0.0, 1.0)
+    support_factor = 0.25 if support else 1.0
+    sag_strength = clamp((0.60 * span_factor + 0.25 * fan_factor + 0.15 * speed_factor) * support_factor, 0.0, 1.0)
+
+    pillar_width = 0.94
+    gap_width = lerp(1.28, 3.20, span_visual)
+    pillar_center_offset = gap_width / 2 + pillar_width / 2
+    bridge_overlap = 0.12
+
+    return {
+        "span_mm": span_mm,
+        "span_factor": span_factor,
+        "fan_factor": fan_factor,
+        "speed_factor": speed_factor,
+        "support_factor": support_factor,
+        "sag_strength": sag_strength,
+        "pillar_layers": 7,
+        "bridge_layers": 7,
+        "left_pillar_x": -pillar_center_offset,
+        "right_pillar_x": pillar_center_offset,
+        "pillar_width": pillar_width,
+        "pillar_depth": 1.56,
+        "bridge_start_x": -gap_width / 2 - bridge_overlap,
+        "bridge_end_x": gap_width / 2 + bridge_overlap,
+        "bridge_y_positions": np.linspace(-0.54, 0.54, 5),
+        "support_x_positions": np.linspace(-gap_width * 0.26, gap_width * 0.26, 3),
+    }
 
 
 def color_tuple(color, alpha=None):
@@ -382,96 +420,50 @@ class PrintSimulationEngine:
         return layers
 
     def generate_overhang(self, params):
-        angle = float(params.get("angle", 55))
-        risk = FDMModel.overhang_risk(params)
-        fan = float(params.get("fan", 70))
-        speed = float(params.get("speed", 55))
-        support = bool(params.get("support", False))
+        config = bridge_scene_config(params)
+        risk = config["sag_strength"]
         layers = []
-        pillar_layers = 7
-        bridge_layers = 7
-        left_pillar_x = -1.58
-        right_pillar_x = 1.58
-        pillar_width = 1.04
-        pillar_depth = 1.56
-        bridge_overlap = 0.10
-        bridge_start_x = left_pillar_x + pillar_width / 2 - bridge_overlap
-        bridge_end_x = right_pillar_x - pillar_width / 2 + bridge_overlap
-        bridge_y_positions = np.linspace(-0.54, 0.54, 5)
-        angle_sag_factor = smoothstep(clamp((angle - 45) / 35, 0.0, 1.0))
-        cooling_sag_factor = smoothstep(1.0 - fan / 100)
-        speed_sag_factor = smoothstep(clamp((speed - 40) / 80, 0.0, 1.0))
-        support_sag_factor = 0.25 if support else 1.0
-        sag_strength = clamp((0.55 * angle_sag_factor + 0.30 * cooling_sag_factor + 0.15 * speed_sag_factor) * support_sag_factor, 0.0, 1.0)
-
-        for layer_index in range(pillar_layers):
+        total_layers = config["pillar_layers"] + config["bridge_layers"]
+        for layer_index in range(total_layers):
             z = self.visual_layer_z(layer_index)
             height = self.visual_segment_height()
             layer = ToolpathLayer(z, layer_index)
-            self.add_rectangle_layer(layer, left_pillar_x, 0, z, pillar_width, pillar_depth, width=0.34, height=height)
-            layers.append(layer)
+            self.add_rectangle_layer(layer, config["left_pillar_x"], 0, z, config["pillar_width"], config["pillar_depth"], width=0.34, height=height)
+            self.add_rectangle_layer(layer, config["right_pillar_x"], 0, z, config["pillar_width"], config["pillar_depth"], width=0.34, height=height)
 
-        for layer_index in range(pillar_layers):
-            z = self.visual_layer_z(layer_index)
-            height = self.visual_segment_height()
-            layer = ToolpathLayer(z, layer_index)
-            self.add_rectangle_layer(layer, right_pillar_x, 0, z, pillar_width, pillar_depth, width=0.34, height=height)
-            layers.append(layer)
-
-        bridge_z = self.visual_layer_z(pillar_layers)
-        if support:
-            support_layer = ToolpathLayer(bridge_z - 0.09, pillar_layers)
-            support_bottom_z = self.visual_layer_z(0) - 0.03
-            support_top_z = bridge_z - 0.095
-            for support_x in np.linspace(-0.48, 0.48, 3):
-                support_layer.segment_list.append(
-                    ToolpathSegment(
-                        (float(support_x), 0.0, support_bottom_z),
-                        (float(support_x), 0.0, support_top_z),
-                        0.16,
-                        0.92,
-                        "support_column",
-                        "#7dd3fc",
-                        defect_strength=0.10,
-                        meta={"support_size_x": 0.16, "support_size_y": 0.92},
+            if layer_index >= config["pillar_layers"]:
+                bridge_index = layer_index - config["pillar_layers"]
+                layer_factor = (bridge_index + 1) / config["bridge_layers"]
+                bridge_width = lerp(0.24, 0.30, config["span_factor"])
+                for line_index, y in enumerate(config["bridge_y_positions"]):
+                    start = (config["bridge_start_x"], float(y), z)
+                    end = (config["bridge_end_x"], float(y), z)
+                    if (bridge_index + line_index) % 2:
+                        start, end = end, start
+                    layer.segment_list.append(
+                        ToolpathSegment(
+                            start,
+                            end,
+                            bridge_width,
+                            height,
+                            "extrusion",
+                            "#ff8a3d",
+                            defect_strength=risk,
+                            meta={
+                                "bridge_profile": True,
+                                "overhang_risk": risk,
+                                "bridge_sag_strength": risk,
+                                "bridge_anchor_left": config["bridge_start_x"],
+                                "bridge_anchor_right": config["bridge_end_x"],
+                                "bridge_span_mm": config["span_mm"],
+                                "overhang_layer_factor": layer_factor,
+                                "overhang_angle_factor": config["span_factor"],
+                                "overhang_cooling_factor": config["fan_factor"],
+                                "overhang_speed_factor": config["speed_factor"],
+                                "overhang_support_factor": config["support_factor"],
+                            },
+                        )
                     )
-                )
-            layers.append(support_layer)
-
-        for bridge_index in range(bridge_layers):
-            z = self.visual_layer_z(pillar_layers + bridge_index)
-            height = self.visual_segment_height()
-            layer = ToolpathLayer(z, pillar_layers + bridge_index)
-            layer_factor = (bridge_index + 1) / bridge_layers
-            bridge_width = lerp(0.24, 0.29, clamp((angle - 20) / 60, 0.0, 1.0))
-            for line_index, y in enumerate(bridge_y_positions):
-                start = (bridge_start_x, float(y), z)
-                end = (bridge_end_x, float(y), z)
-                if (bridge_index + line_index) % 2:
-                    start, end = end, start
-                layer.segment_list.append(
-                    ToolpathSegment(
-                        start,
-                        end,
-                        bridge_width,
-                        height,
-                        "extrusion",
-                        "#ff8a3d",
-                        defect_strength=risk,
-                        meta={
-                            "bridge_profile": True,
-                            "overhang_risk": risk,
-                            "bridge_sag_strength": sag_strength,
-                            "bridge_anchor_left": bridge_start_x,
-                            "bridge_anchor_right": bridge_end_x,
-                            "overhang_layer_factor": layer_factor,
-                            "overhang_angle_factor": angle_sag_factor,
-                            "overhang_cooling_factor": cooling_sag_factor,
-                            "overhang_speed_factor": speed_sag_factor,
-                            "overhang_support_factor": support_sag_factor,
-                        },
-                    )
-                )
             layers.append(layer)
         return layers
 
@@ -659,16 +651,7 @@ class FDMModel:
 
     @staticmethod
     def overhang_risk(params):
-        angle = float(params.get("angle", 55))
-        fan = float(params.get("fan", 70))
-        speed = float(params.get("speed", 55))
-        support = bool(params.get("support", False))
-        angle_factor = smoothstep(clamp((angle - 45) / 35, 0, 1))
-        fan_factor = smoothstep(1 - fan / 100)
-        speed_factor = smoothstep(clamp((speed - 40) / 80, 0, 1))
-        support_factor = 0.25 if support else 1.0
-        base_risk = 0.55 * angle_factor + 0.30 * fan_factor + 0.15 * speed_factor
-        return clamp(base_risk * support_factor, 0, 1)
+        return bridge_scene_config(params)["sag_strength"]
 
     @staticmethod
     def pressure_advance_quality(params):
@@ -680,7 +663,7 @@ class FDMModel:
         tolerance = profile["tolerance"]
         speed_factor = clamp((speed - 30) / (180 - 30), 0.0, 1.0)
         effective_tolerance = tolerance * (1.0 - 0.35 * speed_factor)
-        defect_amplifier = 1.0 + 0.75 * speed_factor
+        defect_amplifier = 1.0 + 1.05 * speed_factor
         distance = abs(pa - ideal)
         quality = clamp(1.0 - (distance / max(effective_tolerance, 0.001)) ** 1.4, 0.0, 1.0)
         defect_span = max(effective_tolerance * PA_DEFECT_SPAN_MULTIPLIER, 0.001)
@@ -789,17 +772,17 @@ class FDMModel:
         if mode == "overhang":
             risk = FDMModel.overhang_risk(params)
             if risk < 0.34:
-                return "Bridge temiz gorunuyor; iki pilon arasindaki filament hatlari duze yakin kaliyor."
+                return "Bridge temiz görünüyor; iki pylon arasındaki filament hatları düze yakın kalıyor."
             if risk < 0.67:
-                return "Bridge ortasinda hafif Z sarkmasi basliyor; fan ve hiz etkisi sahnede okunur."
-            return "Yuksek bridge riski var; boslugun ortasi asagi deforme olur, support sarkmayi guclu azaltir."
+                return "Bridge ortasında sarkma artıyor; fan ve hız etkisi sahnede okunur."
+            return "Yüksek bridge sarkma riski var; açıklık ortası aşağı deforme olur, support sarkmayı güçlü azaltır."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
-                return "PA idealin altında; hız arttıkça köşe blob/şişme etkisi belirginleşir."
+                return "PA idealin altında; test hızı yükseldikçe köşe şişmesi daha belirgin görünür."
             if result["high_pa_defect"] > 0.33:
-                return "PA fazla; yüksek hızda köşe yakınında incelme veya küçük gap daha görünür olur."
-            return "PA ideal aralığa yakın; hız yükselse de köşe basıncı dengeli kalır."
+                return "PA fazla; yüksek test hızında köşe incelmesi veya küçük gap daha görünür olur."
+            return "PA ideal aralığa yakın; test hızı yükselse bile köşe davranışı dengeli kalır."
         if mode == "input":
             if params.get("shaper", "MZV") == "Kapalı":
                 return "Input shaping kapalıyken hız ve ivme arttıkça ringing izleri belirginleşir."
@@ -814,10 +797,10 @@ class FDMModel:
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] <= 0.75:
-                return "Hotend bu debiyi rahat karsiliyor; bead dolu, nozzle/line oranina gore olceklenir."
+                return "Hotend bu debiyi rahat karşılıyor; bead dolu, nozzle/line oranına göre ölçeklenir."
             if result["ratio"] <= 1.0:
-                return "Flow limite yaklasiyor; bead hafif incelir ama cizgi cogunlukla sureklidir."
-            return "Hotend kapasitesi asiliyor; bead cizilirken organik incelme ve kisa bosluklar olusur."
+                return "Flow limite yaklaşıyor; bead hafif incelir ama çizgi çoğunlukla süreklidir."
+            return "Hotend kapasitesi aşılıyor; bead çizilirken organik incelme ve kısa boşluklar oluşur."
         return ""
 
     @staticmethod
@@ -825,14 +808,14 @@ class FDMModel:
         if mode == "intro":
             return "Soldan bir mod seç, parametreleri değiştir ve 3D sahnedeki temsili sonucu izle."
         if mode == "overhang":
-            return "Bridge sarkiyorsa fani artir, hizi azalt veya support kullan; deformasyon boslugun ortasindaki Z dususuyle temsil edilir."
+            return "Bridge ortasında sarkma artıyorsa fanı artır, hızı azalt veya support kullan."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
-                return "Köşelerde şişme varsa PA değerini küçük adımlarla artır; yüksek hız PA toleransını daraltır."
+                return "Köşelerde şişme varsa PA değerini küçük adımlarla artır; yüksek test hızı PA toleransını daraltır."
             if result["high_pa_defect"] > 0.33:
-                return "Köşe öncesi boşluk/incelme varsa PA değerini azalt; hız düşürmek hatayı yumuşatır."
-            return "PA aralığı iyi görünüyor; hız arttıkça tolerans daraldığı için hızlı testlerle de doğrula."
+                return "Köşe öncesi boşluk/incelme varsa PA değerini azalt; test hızını düşürmek hatayı yumuşatır."
+            return "PA aralığı iyi görünüyor; test hızı arttıkça tolerans daraldığı için hızlı testlerle de doğrula."
         if mode == "input":
             return "Ringing belirginse acceleration azalt veya MZV/EI/2HUMP_EI shaper tiplerini karşılaştır."
         if mode == "retraction":
@@ -846,10 +829,10 @@ class FDMModel:
             result = FDMModel.volumetric_flow_risk(params)
             line_ratio = result["line_to_nozzle_ratio"]
             if line_ratio < FLOW_REASONABLE_LINE_RATIO_MIN:
-                return "Line width nozzle capina gore dusuk; yuzey kaplama zayif temsil edilebilir."
+                return "Line width nozzle çapına göre düşük; yüzey kaplama zayıf temsil edilebilir."
             if line_ratio > FLOW_REASONABLE_LINE_RATIO_MAX:
-                return "Line width nozzle capina gore yuksek; akis yuku ve kalite riski artabilir."
-            return "Debi yuksekse hiz, layer height veya line width azaltilabilir; 0.9x-1.4x nozzle araligi makul kabul edilir."
+                return "Line width nozzle çapına göre yüksek; akış yükü ve kalite riski artabilir."
+            return "Line width/nozzle oranı makul; debi yüksekse hız, layer height veya line width azaltılabilir."
         return ""
 
     @staticmethod
@@ -857,10 +840,10 @@ class FDMModel:
         if mode == "intro":
             return "Temsil notu: 3D sahne eğitim amaçlı ölçeklendirilmiştir; gerçek fizik motoru kullanılmaz."
         if mode == "overhang":
-            return "Sag = max_sag * bridge_risk * mid_span_factor^1.4; support riski ciddi azaltir."
+            return "Sag = max_sag * risk * sin(pi * span_position)^1.4; risk açıklık, fan, hız ve support ile hesaplanır."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
-            return f"İdeal PA: {result['ideal']:.3f}, efektif tolerans: ±{result['effective_tolerance']:.3f}, hız çarpanı: {result['defect_amplifier']:.2f}x."
+            return f"İdeal PA: {result['ideal']:.3f}, efektif tolerans: ±{result['effective_tolerance']:.3f}, test hızı etki çarpanı: {result['defect_amplifier']:.2f}x."
         if mode == "input":
             return "Dalga = amplitude × sin(2πx / wavelength) × exp(-decay × x)."
         if mode == "retraction":
@@ -868,16 +851,17 @@ class FDMModel:
             return f"İdeal retraction: {result['ideal']:.1f} mm; güvenli aralık {result['safe_min']:.1f}-{result['safe_max']:.1f} mm."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"Flow = Layer Height x Line Width x Speed = {result['flow']:.2f} mm3/s; LW/ND = {result['line_to_nozzle_ratio']:.2f}x."
+            return f"Flow = Layer Height x Line Width x Print Speed = {result['flow']:.2f} mm3/s; nozzle çapı formüle doğrudan girmez."
         return ""
 
     @staticmethod
     def calculated_value_text(mode, params):
         if mode == "overhang":
-            return f"Bridge sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
+            span_mm = bridge_scene_config(params)["span_mm"]
+            return f"Bridge açıklığı: {span_mm:.0f} mm | Sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
-            return f"PA {result['pa']:.3f} | ideal {result['ideal']:.3f} | hız {result['speed']:.0f} mm/s | tolerans ±{result['effective_tolerance']:.3f}"
+            return f"PA: {result['pa']:.3f} | Test hızı: {result['speed']:.0f} mm/s | Tolerans: ±{result['effective_tolerance']:.3f} | Etki çarpanı: {result['defect_amplifier']:.2f}x"
         if mode == "input":
             return f"Ringing riski: {FDMModel.input_shaping_risk(params) * 100:.0f}%"
         if mode == "retraction":
@@ -885,8 +869,129 @@ class FDMModel:
             return f"Stringing {result['stringing_risk'] * 100:.0f}% | Restart gap {result['restart_gap_risk'] * 100:.0f}%"
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"Flow {result['flow']:.2f} / {float(params.get('max_flow', 12)):.1f} mm3/s | Ratio {result['ratio']:.2f} | Nozzle {result['nozzle_diameter']:.1f} | LW/ND {result['line_to_nozzle_ratio']:.2f}x"
+            return f"Flow: {result['flow']:.2f} mm3/s | Limit: {float(params.get('max_flow', 12)):.1f} | Nozzle çapı: {result['nozzle_diameter']:.1f} mm | Line width/nozzle oranı: {result['line_to_nozzle_ratio']:.2f}x"
         return "3D öğretici görünüm hazır"
+
+    @staticmethod
+    def visual_note_text(mode):
+        if mode == "intro":
+            return "Görsel etki eğitim amaçlı ve temsili gösterilmiştir."
+        return "Görsel etki eğitim amacıyla büyütülmüş/temsili gösterilmiştir."
+
+    @staticmethod
+    def flow_nozzle_note(params):
+        result = FDMModel.volumetric_flow_risk(params)
+        line_ratio = result["line_to_nozzle_ratio"]
+        if line_ratio < FLOW_REASONABLE_LINE_RATIO_MIN:
+            warning = "Line width nozzle'a göre düşük."
+        elif line_ratio > FLOW_REASONABLE_LINE_RATIO_MAX:
+            warning = "Line width nozzle'a göre yüksek; kalite/akış riski artabilir."
+        else:
+            warning = "Line width seçilen nozzle için makul aralıkta."
+        return (
+            "Nozzle çapı debi formülüne doğrudan girmez; line width/nozzle oranı, "
+            f"görsel ölçek ve kalite yorumu için kullanılır. Uyarı: {warning}"
+        )
+
+    @staticmethod
+    def what_happened_text(mode, params):
+        if mode == "intro":
+            return "Bir FDM baskı parametresi eğitim sahnesi hazır."
+        if mode == "overhang":
+            risk = FDMModel.overhang_risk(params)
+            if risk < 0.20:
+                return "Bridge temiz kaldı."
+            if risk < 0.60:
+                return "Bridge ortasında hafif sarkma oluştu."
+            return "Bridge ortasında belirgin sarkma oluştu."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "Köşelerde fazla filament birikimi oluştu."
+            if result["high_pa_defect"] > 0.33:
+                return "Köşe yakınında incelme/gap oluştu."
+            return "Köşe davranışı dengeli görünüyor."
+        if mode == "input":
+            risk = FDMModel.input_shaping_risk(params)
+            if risk > 0.35:
+                return "Duvar kenarında ringing izi oluştu."
+            return "Ringing izi düşük seviyede kaldı."
+        if mode == "retraction":
+            result = FDMModel.retraction_stringing_risk(params)
+            if result["restart_gap_risk"] > 0.35:
+                return "Başlangıç noktasında restart gap oluştu."
+            if result["stringing_risk"] > 0.35:
+                return "Travel sırasında ipliklenme oluştu."
+            return "Travel ve yeniden başlama davranışı dengeli görünüyor."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] > 1.0:
+                return "Extrusion çizgilerinde incelme ve kısa boşluklar oluştu."
+            if result["ratio"] > 0.75:
+                return "Extrusion çizgisi limite yaklaşırken hafif inceldi."
+            return "Extrusion çizgileri dolu ve sürekli kaldı."
+        return ""
+
+    @staticmethod
+    def why_happened_text(mode, params):
+        if mode == "intro":
+            return "Sahneler parametre etkilerini temsili olarak karşılaştırmak için hazırlanmıştır."
+        if mode == "overhang":
+            return "Bridge açıklığı, fan, hız ve support durumuna göre soğuma/sarkma riski değişti."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "PA değeri idealin altında ve test hızı hatayı görünür hale getiriyor."
+            if result["high_pa_defect"] > 0.33:
+                return "PA değeri idealin üstünde ve test hızı incelmeyi görünür hale getiriyor."
+            return "PA değeri ideal aralığa yakın olduğu için basınç dengeli kaldı."
+        if mode == "input":
+            risk = FDMModel.input_shaping_risk(params)
+            if risk <= 0.35:
+                return "Shaper ve hız/ivme ayarları titreşimi düşük tuttu."
+            return "Yüksek hız/ivme mekanik titreşimi görünür hale getiriyor."
+        if mode == "retraction":
+            return "Retraction, sıcaklık ve travel hızı sızıntı ya da restart riskini belirliyor."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] <= 0.75:
+                return "Hesaplanan debi hotend limitinin altında kaldı."
+            if result["ratio"] <= 1.0:
+                return "Hesaplanan debi hotend limitine yaklaşıyor."
+            return "Hesaplanan debi hotend limitini aşıyor."
+        return ""
+
+    @staticmethod
+    def what_to_do_text(mode, params):
+        if mode == "intro":
+            return "Soldan bir mod seçip parametreleri değiştir."
+        if mode == "overhang":
+            return "Fanı artır, hızı azalt veya support kullan."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "PA değerini küçük adımlarla artır."
+            if result["high_pa_defect"] > 0.33:
+                return "PA değerini küçük adımlarla azalt."
+            return "PA değerini koru; farklı test hızlarında doğrula."
+        if mode == "input":
+            risk = FDMModel.input_shaping_risk(params)
+            if risk <= 0.35:
+                return "Ayarları koru; daha yüksek hızlarda shaper tiplerini karşılaştır."
+            return "Acceleration azalt veya shaper tipini karşılaştır."
+        if mode == "retraction":
+            result = FDMModel.retraction_stringing_risk(params)
+            if result["restart_gap_risk"] > 0.35:
+                return "Retraction mesafesini azalt."
+            if result["stringing_risk"] > 0.35:
+                return "Retraction mesafesini artır, sıcaklığı düşür veya travel hızını artır."
+            return "Ayarları koru; malzemeye göre küçük testlerle doğrula."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] <= 0.75:
+                return "Ayarlar güvenli görünüyor; line width/nozzle oranını da kontrol et."
+            return "Hızı, layer height'ı veya line width'i azalt."
+        return ""
 
     @staticmethod
     def progress_items(mode, params):
@@ -928,6 +1033,9 @@ class FDMModel:
             [
                 "",
                 f"Açıklama: {FDMModel.explanation_text(mode, params)}",
+                f"Ne oldu: {FDMModel.what_happened_text(mode, params)}",
+                f"Neden: {FDMModel.why_happened_text(mode, params)}",
+                f"Ne yapmalı: {FDMModel.what_to_do_text(mode, params)}",
                 f"Tavsiye: {FDMModel.recommendation_text(mode, params)}",
                 f"Formül/Metod: {FDMModel.formula_text(mode, params)}",
             ]
@@ -997,7 +1105,19 @@ class GLSceneWidget(QWidget):
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor("#0b1118")
         layout.addWidget(self.view)
+        self.scene_badge = QLabel("Eğitimsel 3D görsel", self)
+        self.scene_badge.setObjectName("SceneBadge")
+        self.scene_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.scene_badge.adjustSize()
+        self.scene_badge.raise_()
         self.update_mode_scene(reset_camera=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "scene_badge"):
+            self.scene_badge.adjustSize()
+            self.scene_badge.move(max(12, self.width() - self.scene_badge.width() - 14), 12)
+            self.scene_badge.raise_()
 
     def setup_camera(self, mode=None):
         if self.view is None:
@@ -1005,7 +1125,7 @@ class GLSceneWidget(QWidget):
         mode = mode or self.state.active_mode
         presets = {
             "intro": ((0, 0, 4.0), 155.0, 28, -42),
-            "overhang": ((0, 0, 3.0), 142.0, 17, -74),
+            "overhang": ((0, 0, 3.2), 154.0, 20, -72),
             "pressure": ((0, 0, 3.2), 150.0, 50, -40),
             "input": ((0, -1.8, 4.8), 138.0, 22, -74),
             "retraction": ((0, 0, 4.8), 155.0, 28, -42),
@@ -1319,7 +1439,7 @@ class GLSceneWidget(QWidget):
                 span_progress = clamp((sample["point"][0] - anchor_min) / max(anchor_max - anchor_min, 0.001), 0.0, 1.0)
                 mid_span_factor = max(0.0, math.sin(math.pi * span_progress))
                 sag_strength = clamp(float(meta.get("bridge_sag_strength", risk)), 0.0, 1.0)
-                max_sag = 0.055 + 0.155 * layer_factor
+                max_sag = 0.085 + 0.265 * layer_factor
                 offsets[index] -= sag_strength * (mid_span_factor ** 1.40) * max_sag
                 continue
             root_x = float(meta.get("overhang_root_x", sample["point"][0]))
@@ -1783,9 +1903,26 @@ class GLSceneWidget(QWidget):
         self.add_line([(tip[0], tip[1], tip[2] + 9.00 * ns), (tip[0] - 4.8 * ns, tip[1] - 2.3 * ns, tip[2] + 15.5 * ns)], "#8190a0", 2.0, 0.75)
         self.add_line([(tip[0], tip[1], tip[2] + 9.00 * ns), (tip[0] + 4.8 * ns, tip[1] + 2.3 * ns, tip[2] + 15.5 * ns)], "#8190a0", 2.0, 0.75)
 
+    def add_overhang_supports(self):
+        if self.state.active_mode != "overhang":
+            return
+        params = self.state.current_params()
+        if not bool(params.get("support", False)):
+            return
+        config = bridge_scene_config(params)
+        z_bottom = self.engine.visual_layer_z(0) - 0.03
+        z_top = self.engine.visual_layer_z(config["pillar_layers"]) - 0.105
+        if z_top <= z_bottom:
+            return
+        for support_x in config["support_x_positions"]:
+            center = self.scene_point((float(support_x), 0.0, (z_bottom + z_top) * 0.5))
+            size = (0.14 * PART_SCALE, 0.88 * PART_SCALE, (z_top - z_bottom) * Z_VISUAL_SCALE)
+            self.add_box(center=center, size=size, color="#7dd3fc", alpha=0.24, edge="#438eb8")
+
     def build_static_scene(self):
         self.add_grid()
         self.add_print_bed()
+        self.add_overhang_supports()
 
     def draw_completed_segments(self):
         for item in self.collect_bead_runs(self.engine.completed_segments):
@@ -1829,6 +1966,7 @@ class ParameterPanel(QWidget):
     def __init__(self, state):
         super().__init__()
         self.state = state
+        self.setObjectName("ParameterPanel")
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(9)
@@ -1844,61 +1982,47 @@ class ParameterPanel(QWidget):
     def rebuild(self):
         self.clear_layout()
         title = QLabel(MODE_LABELS[self.state.active_mode])
-        title.setObjectName("PanelTitle")
+        title.setObjectName("ModeTitle")
+        title.setWordWrap(True)
         self.layout.addWidget(title)
         if self.state.active_mode == "intro":
             self.build_intro_panel()
         elif self.state.active_mode == "overhang":
-            self.add_help("İki pilon arasındaki bridge çizgilerinde fan, hız ve support sarkma miktarını değiştirir.")
+            self.add_help("İki pylon arasındaki bridge çizgilerinde fan, hız ve support sarkmayı etkiler.")
+            self.add_section_title("Parametreler")
             self.build_overhang_controls()
         elif self.state.active_mode == "pressure":
             self.add_help("Pressure Advance köşe basıncı, blob ve gap davranışını temsili olarak gösterir.")
+            self.add_section_title("Parametreler")
             self.build_pressure_controls()
         elif self.state.active_mode == "input":
             self.add_help("Shaper tipi ve hız/ivme değerleri yüzeydeki ringing izlerini değiştirir.")
+            self.add_section_title("Parametreler")
             self.build_input_controls()
         elif self.state.active_mode == "retraction":
             self.add_help("Retraction travel sırasındaki sızıntıyı ve fazla retraction gap riskini etkiler.")
+            self.add_section_title("Parametreler")
             self.build_retraction_controls()
         elif self.state.active_mode == "flow":
             self.add_help("Layer height × line width × speed hotend'in eritmesi gereken debiyi verir.")
+            self.add_section_title("Parametreler")
             self.build_flow_controls()
         self.layout.addStretch(1)
 
     def build_intro_panel(self):
-        self.add_help("Mouse ile 3D sahneyi döndürüp yakınlaştırabilirsin. Soldan bir mod seçerek ayarların etkisini izle.")
-        cards = [
-            ("FDM mantığı", "Filament eritilir ve nozzle üzerinden katman katman serilir."),
-            ("3D temsil", "Sahne gerçek fizik çözmez; parametre etkisini teknik demo olarak gösterir."),
-            ("Modlar", "Overhang, PA, ringing, stringing ve flow davranışları ayrı sahnelerde incelenir."),
-        ]
-        for heading, body in cards:
-            card = QFrame()
-            card.setObjectName("InfoCard")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(12, 10, 12, 10)
-            head = QLabel(heading)
-            head.setObjectName("CardTitle")
-            text = QLabel(body)
-            text.setWordWrap(True)
-            text.setObjectName("MutedText")
-            layout.addWidget(head)
-            layout.addWidget(text)
-            self.layout.addWidget(card)
+        self.add_help("Soldan bir mod seç; 3D sahnede parametrelerin temsili etkisini izle.")
 
     def add_help(self, text):
-        frame = QFrame()
-        frame.setObjectName("HelpBox")
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 10, 12, 10)
-        label = QLabel("Bu mod ne gösterir?")
-        label.setObjectName("CardTitle")
         body = QLabel(text)
         body.setWordWrap(True)
-        body.setObjectName("MutedText")
-        layout.addWidget(label)
-        layout.addWidget(body)
-        self.layout.addWidget(frame)
+        body.setObjectName("ModeDescription")
+        body.setMaximumHeight(36)
+        self.layout.addWidget(body)
+
+    def add_section_title(self, text):
+        label = QLabel(text)
+        label.setObjectName("SectionLabel")
+        self.layout.addWidget(label)
 
     def current_value(self, key, default):
         return self.state.current_params().get(key, default)
@@ -1906,10 +2030,12 @@ class ParameterPanel(QWidget):
     def add_slider(self, label_text, key, min_value, max_value, step, unit, tooltip):
         frame = QFrame()
         frame.setObjectName("ControlRow")
-        frame.setMinimumHeight(68)
+        frame.setMinimumHeight(50)
         layout = QGridLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(9, 5, 9, 5)
+        layout.setVerticalSpacing(4)
         title = QLabel(label_text)
+        title.setObjectName("ControlTitle")
         title.setWordWrap(True)
         title.setToolTip(tooltip)
         value_label = QLabel()
@@ -1958,12 +2084,18 @@ class ParameterPanel(QWidget):
         checkbox.stateChanged.connect(changed)
         self.layout.addWidget(checkbox)
 
-    def add_combo(self, label_text, key, options, tooltip):
+    def add_combo(self, label_text, key, options, tooltip, unit=""):
         frame = QFrame()
         frame.setObjectName("ControlRow")
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout = QGridLayout(frame)
+        layout.setContentsMargins(9, 5, 9, 5)
+        layout.setVerticalSpacing(4)
         title = QLabel(label_text)
+        title.setObjectName("ControlTitle")
+        value_label = QLabel()
+        value_label.setObjectName("ValueLabel")
+        value_label.setMinimumWidth(96)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         combo = QComboBox()
         combo.addItems(options)
         combo.setToolTip(tooltip)
@@ -1971,25 +2103,32 @@ class ParameterPanel(QWidget):
         if current in options:
             combo.setCurrentText(current)
 
+        def format_combo_value(text):
+            return f"{text} {unit}".strip()
+
         def changed(text):
+            value_label.setText(format_combo_value(text))
             self.state.update_parameter(key, text)
             self.parameters_changed.emit()
 
+        value_label.setText(format_combo_value(combo.currentText()))
         combo.currentTextChanged.connect(changed)
-        layout.addWidget(title)
-        layout.addWidget(combo)
+        layout.addWidget(title, 0, 0)
+        layout.addWidget(value_label, 0, 1)
+        layout.addWidget(combo, 1, 0, 1, 2)
+        layout.setColumnStretch(0, 1)
         self.layout.addWidget(frame)
 
     def build_overhang_controls(self):
-        self.add_slider("Bridge zorluğu", "angle", 20, 80, 1, "derece", "Yüksek değer daha zor bridge koşulunu temsil eder.")
+        self.add_slider("Bridge açıklığı", "angle", 10, 80, 1, "mm", "İki pylon arasındaki köprü mesafesini temsil eder.")
         self.add_slider("Fan hızı", "fan", 0, 100, 1, "%", "Bridge filamentinin ne kadar hızlı soğuduğunu temsil eder.")
         self.add_slider("Baskı hızı", "speed", 20, 120, 1, "mm/s", "Bridge sırasında yüksek hız sarkmayı artırabilir.")
-        self.add_checkbox("Support kullan", "support", "Boşluğun altına geçici destek eklenmesini veya sag riskinin düşmesini temsil eder.")
+        self.add_checkbox("Support kullan", "support", "Boşluğun altında sade destek kolonları gösterir ve sag riskini düşürür.")
 
     def build_pressure_controls(self):
         self.add_slider("Pressure Advance", "pa", PA_SLIDER_MIN, PA_SLIDER_MAX, PA_SLIDER_STEP, "", "Köşe basıncını 0.005 adımlarla dengelemeyi temsil eder.")
         self.add_combo("Extruder tipi", "extruder", ["Direct Drive", "Bowden"], "Direct drive ve Bowden için ideal PA farklıdır.")
-        self.add_slider("Baskı hızı", "speed", 30, 180, 1, "mm/s", "Hız arttıkça basınç değişimleri belirginleşir.")
+        self.add_slider("Test hızı", "speed", 30, 180, 1, "mm/s", "Bu hız, PA testinde köşe davranışını zorlaştıran temsili test hızıdır. Yüksek test hızı, düşük/yüksek PA hatalarını daha görünür yapar.")
 
     def build_input_controls(self):
         self.add_slider("Acceleration", "acceleration", 500, 10000, 100, "mm/s²", "Yüksek ivme ringing riskini artırabilir.")
@@ -2008,7 +2147,7 @@ class ParameterPanel(QWidget):
         self.add_slider("Line Width", "line_width", 0.35, 0.80, 0.01, "mm", "Çizgi genişliği debiyi etkiler.")
         self.add_slider("Print Speed", "print_speed", 20, 250, 1, "mm/s", "Baskı hızı debiyi doğrudan artırır.")
         self.add_slider("Hotend kapasitesi", "max_flow", 4, 35, 1, "mm³/s", "Hotend'in eritebildiği yaklaşık hacimdir.")
-        self.add_combo("Nozzle çapı", "nozzle_diameter", ["0.4", "0.6", "0.8"], "Nozzle çapı çizgi genişliği davranışını etkileyebilir.")
+        self.add_combo("Nozzle çapı", "nozzle_diameter", ["0.4", "0.6", "0.8"], "Nozzle çapı tek başına debiyi değiştirmez. Debiyi layer height, line width ve print speed belirler; nozzle çapı line width'in mantıklı aralıkta olup olmadığını yorumlamak için kullanılır.", "mm")
 
 
 class InfoPanel(QWidget):
@@ -2017,62 +2156,61 @@ class InfoPanel(QWidget):
         self.state = state
         self.setObjectName("InfoPanel")
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(10, 10, 10, 10)
-        self.layout.setSpacing(8)
+        self.layout.setContentsMargins(10, 8, 10, 8)
+        self.layout.setSpacing(5)
+        title = QLabel("Sonuç")
+        title.setObjectName("CardTitle")
         self.score_label = QLabel()
-        self.score_label.setObjectName("BigScore")
-        self.score_label.setAlignment(Qt.AlignCenter)
+        self.score_label.setObjectName("ResultScore")
+        self.score_bar = QProgressBar()
+        self.score_bar.setRange(0, 100)
+        self.score_bar.setTextVisible(False)
         self.calculated = QLabel()
-        self.calculated.setObjectName("MetricBox")
+        self.calculated.setObjectName("ResultLine")
         self.calculated.setWordWrap(True)
-        self.bars_layout = QVBoxLayout()
-        self.recommendation = QLabel()
-        self.recommendation.setObjectName("MutedText")
-        self.recommendation.setWordWrap(True)
+        self.visual_note = QLabel()
+        self.visual_note.setObjectName("TechNote")
+        self.visual_note.setWordWrap(True)
+        self.what_label = QLabel()
+        self.what_label.setObjectName("ResultLine")
+        self.what_label.setWordWrap(True)
+        self.why_label = QLabel()
+        self.why_label.setObjectName("ResultLine")
+        self.why_label.setWordWrap(True)
+        self.todo_label = QLabel()
+        self.todo_label.setObjectName("ResultLine")
+        self.todo_label.setWordWrap(True)
+        self.layout.addWidget(title)
         self.layout.addWidget(self.score_label)
+        self.layout.addWidget(self.score_bar)
         self.layout.addWidget(self.calculated)
-        self.layout.addLayout(self.bars_layout)
-        self.layout.addWidget(self.recommendation)
-        self.layout.addStretch(1)
+        self.layout.addWidget(self.what_label)
+        self.layout.addWidget(self.why_label)
+        self.layout.addWidget(self.todo_label)
+        self.layout.addWidget(self.visual_note)
         self.update_info()
 
-    def clear_bars(self):
-        while self.bars_layout.count():
-            item = self.bars_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-
-    def add_progress(self, label, value, is_risk):
-        value = clamp(value, 0.0, 1.0)
-        color = risk_color(value) if is_risk else quality_color(value)
-        row = QFrame()
-        row.setObjectName("ProgressCard")
-        layout = QVBoxLayout(row)
-        layout.setContentsMargins(10, 7, 10, 7)
-        title = QLabel(f"{label}: {int(round(value * 100))}/100")
-        title.setObjectName("CardTitle")
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setValue(int(round(value * 100)))
-        bar.setTextVisible(False)
-        bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color.name()}; border-radius: 4px; }}")
-        layout.addWidget(title)
-        layout.addWidget(bar)
-        self.bars_layout.addWidget(row)
+    def compact_technical_note(self, mode, params):
+        if mode == "intro":
+            return FDMModel.visual_note_text(mode)
+        if mode == "flow":
+            return "Flow = Layer Height x Line Width x Print Speed. Nozzle çapı debi formülüne doğrudan girmez; line width/nozzle oranı kalite yorumu içindir."
+        return f"{FDMModel.formula_text(mode, params)} Görsel etki temsili ölçeklendirilmiştir."
 
     def update_info(self):
         mode = self.state.active_mode
         params = self.state.current_params()
         score_label, normalized, score, is_risk = FDMModel.score_for_mode(mode, params)
         color = risk_color(normalized) if is_risk else quality_color(normalized)
-        self.score_label.setText(f"{score_label}\n{score}/100")
+        self.score_label.setText(f"{score_label}: {score}/100")
         self.score_label.setStyleSheet(f"color: {color.name()};")
-        self.calculated.setText(f"Hesaplanan değer\n{FDMModel.calculated_value_text(mode, params)}")
-        self.recommendation.setText(f"Tavsiye: {FDMModel.recommendation_text(mode, params)}")
-        self.clear_bars()
-        for label, value, bar_is_risk in FDMModel.progress_items(mode, params):
-            self.add_progress(label, value, bar_is_risk)
+        self.score_bar.setValue(score)
+        self.score_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color.name()}; border-radius: 4px; }}")
+        self.calculated.setText(f"Hesaplanan değer: {FDMModel.calculated_value_text(mode, params)}")
+        self.what_label.setText(f"Ne oldu? {FDMModel.what_happened_text(mode, params)}")
+        self.why_label.setText(f"Neden? {FDMModel.why_happened_text(mode, params)}")
+        self.todo_label.setText(f"Ne yapmalı? {FDMModel.what_to_do_text(mode, params)}")
+        self.visual_note.setText(f"Teknik not: {self.compact_technical_note(mode, params)}")
 
 
 class MainWindow(QMainWindow):
@@ -2094,8 +2232,8 @@ class MainWindow(QMainWindow):
     def build_ui(self):
         root = QWidget()
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(14, 12, 14, 14)
-        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
         root_layout.addWidget(self.build_header())
 
         splitter = QSplitter(Qt.Horizontal)
@@ -2104,7 +2242,10 @@ class MainWindow(QMainWindow):
         self.scene_widget = GLSceneWidget(self.state)
         splitter.addWidget(self.scene_widget)
         splitter.addWidget(self.build_right_panel())
-        splitter.setSizes([236, 900, 430])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([198, 1080, 334])
         root_layout.addWidget(splitter, 1)
         root_layout.addWidget(self.build_footer())
         self.setCentralWidget(root)
@@ -2112,8 +2253,10 @@ class MainWindow(QMainWindow):
     def build_header(self):
         frame = QFrame()
         frame.setObjectName("Header")
+        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(2)
         title = QLabel("FDM Parametreleri Görselleştiricisi")
         title.setObjectName("AppTitle")
         subtitle = QLabel("Yeni Başlayanlar İçin FDM 3D Baskı Ayarları Görsel Rehberi")
@@ -2125,10 +2268,10 @@ class MainWindow(QMainWindow):
     def build_left_panel(self):
         panel = QFrame()
         panel.setObjectName("SidePanel")
-        panel.setFixedWidth(236)
+        panel.setFixedWidth(198)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(9, 9, 9, 9)
+        layout.setSpacing(6)
         layout.addWidget(self.panel_title("Modlar"))
         self.mode_buttons = {}
         self.mode_group = QButtonGroup(self)
@@ -2142,82 +2285,93 @@ class MainWindow(QMainWindow):
             self.mode_buttons[mode] = button
             layout.addWidget(button)
         self.mode_buttons[self.state.active_mode].setChecked(True)
-        layout.addWidget(self.separator())
-        layout.addWidget(self.panel_title("Animasyon"))
-        for text, slot in [
-            ("Başlat", self.start_animation),
-            ("Durdur", self.stop_animation),
-            ("Sıfırla", self.reset_animation),
-            ("Yavaşlat", self.slower_animation),
-            ("Hızlandır", self.faster_animation),
-        ]:
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            layout.addWidget(button)
-
-        speed_row = QHBoxLayout()
-        speed_row.addWidget(QLabel("Animasyon hızı"))
-        speed_row.addStretch(1)
-        self.speed_value = QLabel("1.00x")
-        self.speed_value.setObjectName("ValueLabel")
-        speed_row.addWidget(self.speed_value)
-        layout.addLayout(speed_row)
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setMinimum(20)
-        self.speed_slider.setMaximum(300)
-        self.speed_slider.setValue(100)
-        self.speed_slider.valueChanged.connect(self.set_animation_speed_from_slider)
-        layout.addWidget(self.speed_slider)
-
-        layout.addWidget(self.separator())
-        layout.addWidget(self.panel_title("Preset"))
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(["PLA", "PETG", "ABS", "Custom"])
-        self.preset_combo.setCurrentText(self.state.selected_preset)
-        self.preset_combo.currentTextChanged.connect(self.apply_preset)
-        layout.addWidget(self.preset_combo)
-        export_button = QPushButton("Sahneyi PNG olarak kaydet")
-        export_button.clicked.connect(self.export_png)
-        layout.addWidget(export_button)
         layout.addStretch(1)
         return panel
 
     def build_right_panel(self):
         panel = QFrame()
         panel.setObjectName("RightPanel")
-        panel.setMinimumWidth(390)
+        panel.setMinimumWidth(318)
+        panel.setMaximumWidth(386)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(9, 9, 9, 9)
+        layout.setSpacing(7)
         self.parameter_panel = ParameterPanel(self.state)
         self.parameter_panel.parameters_changed.connect(self.parameters_changed)
         scroll = QScrollArea()
+        scroll.setObjectName("ParameterScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.viewport().setObjectName("ParameterViewport")
+        scroll.viewport().setAutoFillBackground(False)
         scroll.setWidget(self.parameter_panel)
-        layout.addWidget(scroll, 4)
+        layout.addWidget(scroll, 1)
         self.info_panel = InfoPanel(self.state)
-        layout.addWidget(self.info_panel, 1)
+        layout.addWidget(self.info_panel, 0)
         return panel
 
     def build_footer(self):
         footer = QFrame()
         footer.setObjectName("Footer")
-        layout = QGridLayout(footer)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setHorizontalSpacing(16)
-        self.footer_warning = QLabel("Bu uygulama gerçek fizik simülasyonu değildir; öğretici ve temsili 3D görselleştirme yapar.")
-        self.footer_warning.setObjectName("WarningText")
-        self.footer_warning.setWordWrap(True)
-        self.footer_explanation = QLabel()
-        self.footer_explanation.setObjectName("BodyText")
-        self.footer_explanation.setWordWrap(True)
-        self.copy_button = QPushButton("Rapor İçin Değerleri Kopyala")
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout = QVBoxLayout(footer)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(7)
+        for text, slot in [
+            ("Başlat", self.start_animation),
+            ("Durdur", self.stop_animation),
+            ("Sıfırla", self.reset_animation),
+        ]:
+            button = QPushButton(text)
+            button.setObjectName("ToolbarButton")
+            button.setFixedHeight(30)
+            button.clicked.connect(slot)
+            toolbar.addWidget(button)
+
+        toolbar.addSpacing(8)
+        toolbar.addWidget(QLabel("Animasyon hızı"))
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setMinimum(20)
+        self.speed_slider.setMaximum(300)
+        self.speed_slider.setValue(100)
+        self.speed_slider.setFixedWidth(186)
+        self.speed_slider.valueChanged.connect(self.set_animation_speed_from_slider)
+        toolbar.addWidget(self.speed_slider)
+        self.speed_value = QLabel("1.00x")
+        self.speed_value.setObjectName("ValueLabel")
+        self.speed_value.setFixedWidth(54)
+        toolbar.addWidget(self.speed_value)
+
+        toolbar.addSpacing(8)
+        toolbar.addWidget(QLabel("Preset"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["PLA", "PETG", "ABS", "Custom"])
+        self.preset_combo.setCurrentText(self.state.selected_preset)
+        self.preset_combo.currentTextChanged.connect(self.apply_preset)
+        self.preset_combo.setFixedWidth(112)
+        toolbar.addWidget(self.preset_combo)
+
+        export_button = QPushButton("PNG Kaydet")
+        export_button.setObjectName("ToolbarButton")
+        export_button.setFixedHeight(30)
+        export_button.clicked.connect(self.export_png)
+        toolbar.addWidget(export_button)
+        self.copy_button = QPushButton("Raporu Kopyala")
+        self.copy_button.setObjectName("ToolbarButton")
+        self.copy_button.setFixedHeight(30)
         self.copy_button.clicked.connect(self.copy_report)
-        layout.addWidget(self.footer_warning, 0, 0)
-        layout.addWidget(self.footer_explanation, 1, 0)
-        layout.addWidget(self.copy_button, 0, 1, 2, 1)
-        layout.setColumnStretch(0, 1)
+        toolbar.addWidget(self.copy_button)
+        toolbar.addStretch(1)
+
+        self.footer_explanation = QLabel()
+        self.footer_explanation.setObjectName("StatusText")
+        self.footer_explanation.setWordWrap(False)
+        self.footer_explanation.setMaximumHeight(18)
+        layout.addLayout(toolbar)
+        layout.addWidget(self.footer_explanation)
         self.update_footer()
         return footer
 
@@ -2289,7 +2443,18 @@ class MainWindow(QMainWindow):
         self.scene_widget.update_mode_scene(reset_camera=rebuild_parameters)
 
     def update_footer(self):
-        self.footer_explanation.setText(FDMModel.explanation_text(self.state.active_mode, self.state.current_params()))
+        mode_messages = {
+            "intro": "Soldan bir mod seç; 3D sahnede temsili etkiyi izle.",
+            "overhang": "Bridge açıklığı, fan, hız ve support sarkma görünümünü etkiler.",
+            "pressure": "Test hızı, PA köşe hatalarının görünürlüğünü artırır.",
+            "input": "Shaper ve ivme ayarı ringing izini değiştirir.",
+            "retraction": "Retraction ayarı stringing ve restart gap dengesini gösterir.",
+            "flow": "Flow hesabı layer height, line width ve print speed ile yapılır.",
+        }
+        self.footer_explanation.setText(
+            "Gerçek fizik motoru değildir; parametre etkileri eğitim amaçlı temsil edilir. "
+            f"{mode_messages.get(self.state.active_mode, '')}"
+        )
 
     def tick(self):
         if self.state.running:
@@ -2330,35 +2495,53 @@ class MainWindow(QMainWindow):
                 background: #101821; border: 1px solid #1f2c39; border-radius: 8px;
             }
             #Header { background: #111b25; }
-            #AppTitle { font-size: 20pt; font-weight: 700; color: #ffffff; }
-            #AppSubtitle { color: #9fb0c0; }
-            #PanelTitle { font-size: 11pt; font-weight: 700; color: #ffffff; }
+            #AppTitle { font-size: 15pt; font-weight: 700; color: #ffffff; }
+            #AppSubtitle { color: #9fb0c0; font-size: 9pt; }
+            #PanelTitle { font-size: 10.5pt; font-weight: 700; color: #ffffff; }
+            #ModeTitle { font-size: 13pt; font-weight: 800; color: #ffffff; }
+            #ModeDescription { color: #aebaca; font-size: 9pt; line-height: 120%; }
+            #SectionLabel { color: #ffbc84; font-size: 8.7pt; font-weight: 800; padding-top: 2px; }
+            #ControlTitle { color: #eaf0f6; font-weight: 600; }
             #CardTitle { font-weight: 700; color: #f3f7fb; }
             #MutedText { color: #aebaca; }
             #BodyText { color: #dce6ee; }
             #WarningText { color: #ffcf7a; font-weight: 600; }
-            #InfoCard, #HelpBox, #ControlRow, #ProgressCard, #MetricBox {
-                background: #121d27; border: 1px solid #263645; border-radius: 8px;
+            #StatusText { color: #9fb0c0; font-size: 8.7pt; }
+            #ResultScore { font-weight: 800; font-size: 11pt; }
+            #ResultLine { color: #cfe0ee; font-size: 8.8pt; }
+            #TechNote {
+                color: #90a7b8; font-size: 8.7pt; padding-top: 2px;
+                border-top: 1px solid #233241;
+            }
+            #SceneBadge {
+                color: #c8d6e2; background: rgba(12, 18, 25, 185);
+                border: 1px solid #2a3b4c; border-radius: 8px;
+                padding: 5px 8px; font-size: 8.5pt; font-weight: 700;
+            }
+            #InfoCard, #HelpBox, #ControlRow, #MetricBox {
+                background: #121d27; border: 1px solid #223140; border-radius: 7px;
             }
             #MetricBox, #FormulaText {
                 padding: 7px; color: #cfe8ff; background: #0d141c; border: 1px solid #253546; border-radius: 8px;
-            }
-            #BigScore {
-                font-size: 15pt; font-weight: 800; background: #0d141c; border: 1px solid #253546;
-                border-radius: 8px; padding: 8px;
             }
             #ErrorBox {
                 color: #ffb3b8; background: #27151a; border: 1px solid #63303b; border-radius: 8px; padding: 14px;
             }
             QPushButton {
-                background: #1a2633; color: #eaf0f6; border: 1px solid #2e4254; border-radius: 7px; padding: 8px 9px;
+                background: #1a2633; color: #eaf0f6; border: 1px solid #2e4254; border-radius: 7px; padding: 5px 8px;
+                min-height: 22px;
             }
             QPushButton:hover { background: #233345; border-color: #436176; }
             QPushButton:pressed { background: #16212c; }
-            QPushButton#ModeButton { text-align: left; }
-            QPushButton#ModeButton:checked { background: #25384a; border-color: #ff8a3d; color: #ffffff; }
+            QPushButton#ModeButton { text-align: left; padding: 7px 8px; }
+            QPushButton#ModeButton:checked {
+                background: #26394b; border-color: #ff8a3d; color: #ffffff;
+                font-weight: 700;
+            }
+            QPushButton#ToolbarButton { min-width: 76px; }
             QComboBox {
-                background: #0d141c; color: #eaf0f6; border: 1px solid #2d4153; border-radius: 6px; padding: 7px 8px;
+                background: #0d141c; color: #eaf0f6; border: 1px solid #2d4153; border-radius: 6px; padding: 5px 8px;
+                min-height: 22px;
             }
             QComboBox QAbstractItemView { background: #101821; color: #eaf0f6; selection-background-color: #25384a; }
             QSlider::groove:horizontal { height: 6px; background: #263645; border-radius: 3px; }
@@ -2368,11 +2551,13 @@ class MainWindow(QMainWindow):
                 border: 2px solid #ff8a3d; border-radius: 8px;
             }
             QCheckBox {
-                background: #121d27; border: 1px solid #263645; border-radius: 8px; padding: 8px;
+                background: #121d27; border: 1px solid #263645; border-radius: 7px; padding: 6px;
             }
             QProgressBar {
                 background: #263645; border: 0; border-radius: 4px; height: 8px;
             }
+            QSplitter::handle { background: #090d13; }
+            #ParameterPanel, #ParameterViewport { background: transparent; }
             QScrollArea { background: transparent; border: none; }
             QScrollBar:vertical { background: #0c1219; width: 10px; margin: 2px; border-radius: 5px; }
             QScrollBar::handle:vertical { background: #2b3c4d; min-height: 36px; border-radius: 5px; }
