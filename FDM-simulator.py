@@ -96,6 +96,20 @@ Z_VISUAL_SCALE = 6.0
 LINE_WIDTH_VISUAL = 0.58
 LAYER_HEIGHT_VISUAL = 0.40
 NOZZLE_SCALE = 0.62
+FLOW_REASONABLE_LINE_RATIO_MIN = 0.90
+FLOW_REASONABLE_LINE_RATIO_MAX = 1.40
+PA_SLIDER_MIN = 0.0
+PA_SLIDER_MAX = 0.20
+PA_SLIDER_STEP = 0.005
+PRESSURE_ADVANCE_SETTINGS = {
+    "Direct Drive": {"ideal": 0.05, "tolerance": 0.035},
+    "Bowden": {"ideal": 0.13, "tolerance": 0.060},
+}
+PA_DEFECT_SPAN_MULTIPLIER = 3.2
+RETRACTION_SETTINGS = {
+    "Direct Drive": {"ideal": 1.0, "safe_min": 0.7, "safe_max": 1.5, "over_span": 2.4},
+    "Bowden": {"ideal": 4.5, "safe_min": 3.5, "safe_max": 5.5, "over_span": 3.2},
+}
 
 
 def clamp(value, min_value, max_value):
@@ -364,51 +378,99 @@ class PrintSimulationEngine:
             layer = ToolpathLayer(z, layer_index)
             height = self.visual_segment_height()
             self.add_rectangle_layer(layer, 0, 0, z, 3.1, 1.75, width=0.32, height=height)
-            self.add_infill_lines(layer, 0, 0, z, 3.1, 1.75, count=2, height=height * 0.9)
             layers.append(layer)
         return layers
 
     def generate_overhang(self, params):
         angle = float(params.get("angle", 55))
         risk = FDMModel.overhang_risk(params)
+        fan = float(params.get("fan", 70))
+        speed = float(params.get("speed", 55))
         support = bool(params.get("support", False))
         layers = []
-        base_layers = 8
-        overhang_layers = 10
-        offset_per_layer = lerp(0.07, 0.24, (angle - 20) / 60)
-        for layer_index in range(base_layers + overhang_layers):
+        pillar_layers = 7
+        bridge_layers = 7
+        left_pillar_x = -1.58
+        right_pillar_x = 1.58
+        pillar_width = 1.04
+        pillar_depth = 1.56
+        bridge_overlap = 0.10
+        bridge_start_x = left_pillar_x + pillar_width / 2 - bridge_overlap
+        bridge_end_x = right_pillar_x - pillar_width / 2 + bridge_overlap
+        bridge_y_positions = np.linspace(-0.54, 0.54, 5)
+        angle_sag_factor = smoothstep(clamp((angle - 45) / 35, 0.0, 1.0))
+        cooling_sag_factor = smoothstep(1.0 - fan / 100)
+        speed_sag_factor = smoothstep(clamp((speed - 40) / 80, 0.0, 1.0))
+        support_sag_factor = 0.25 if support else 1.0
+        sag_strength = clamp((0.55 * angle_sag_factor + 0.30 * cooling_sag_factor + 0.15 * speed_sag_factor) * support_sag_factor, 0.0, 1.0)
+
+        for layer_index in range(pillar_layers):
             z = self.visual_layer_z(layer_index)
             height = self.visual_segment_height()
             layer = ToolpathLayer(z, layer_index)
-            if support and layer_index < base_layers + overhang_layers - 1:
-                for sx in [0.85, 1.65, 2.45]:
-                    layer.segment_list.append(ToolpathSegment((sx, -0.38, z - 0.04), (sx, 0.38, z - 0.04), 0.18, height * 0.75, "support", "#7dd3fc", defect_strength=0.15))
-            if layer_index < base_layers:
-                self.add_rectangle_layer(layer, -1.45, 0, z, 1.65, 1.75, width=0.34, height=height)
-                self.add_infill_lines(layer, -1.45, 0, z, 1.65, 1.75, count=2, height=height * 0.9)
-            else:
-                over_index = layer_index - base_layers
-                cx = -1.00 + (over_index + 1) * offset_per_layer
-                z_visual = z
-                length = 1.80 + over_index * offset_per_layer
-                tip_x = cx + length / 2
-                self.add_rectangle_layer(
-                    layer,
-                    cx,
-                    0,
-                    z_visual,
-                    length,
-                    1.55,
-                    width=0.30,
-                    height=height,
-                    color="#ff8a3d",
-                    defect=risk,
-                    meta={
-                        "overhang_risk": risk,
-                        "overhang_root_x": -0.62,
-                        "overhang_tip_x": tip_x,
-                        "overhang_layer_factor": (over_index + 1) / overhang_layers,
-                    },
+            self.add_rectangle_layer(layer, left_pillar_x, 0, z, pillar_width, pillar_depth, width=0.34, height=height)
+            layers.append(layer)
+
+        for layer_index in range(pillar_layers):
+            z = self.visual_layer_z(layer_index)
+            height = self.visual_segment_height()
+            layer = ToolpathLayer(z, layer_index)
+            self.add_rectangle_layer(layer, right_pillar_x, 0, z, pillar_width, pillar_depth, width=0.34, height=height)
+            layers.append(layer)
+
+        bridge_z = self.visual_layer_z(pillar_layers)
+        if support:
+            support_layer = ToolpathLayer(bridge_z - 0.09, pillar_layers)
+            support_bottom_z = self.visual_layer_z(0) - 0.03
+            support_top_z = bridge_z - 0.095
+            for support_x in np.linspace(-0.48, 0.48, 3):
+                support_layer.segment_list.append(
+                    ToolpathSegment(
+                        (float(support_x), 0.0, support_bottom_z),
+                        (float(support_x), 0.0, support_top_z),
+                        0.16,
+                        0.92,
+                        "support_column",
+                        "#7dd3fc",
+                        defect_strength=0.10,
+                        meta={"support_size_x": 0.16, "support_size_y": 0.92},
+                    )
+                )
+            layers.append(support_layer)
+
+        for bridge_index in range(bridge_layers):
+            z = self.visual_layer_z(pillar_layers + bridge_index)
+            height = self.visual_segment_height()
+            layer = ToolpathLayer(z, pillar_layers + bridge_index)
+            layer_factor = (bridge_index + 1) / bridge_layers
+            bridge_width = lerp(0.24, 0.29, clamp((angle - 20) / 60, 0.0, 1.0))
+            for line_index, y in enumerate(bridge_y_positions):
+                start = (bridge_start_x, float(y), z)
+                end = (bridge_end_x, float(y), z)
+                if (bridge_index + line_index) % 2:
+                    start, end = end, start
+                layer.segment_list.append(
+                    ToolpathSegment(
+                        start,
+                        end,
+                        bridge_width,
+                        height,
+                        "extrusion",
+                        "#ff8a3d",
+                        defect_strength=risk,
+                        meta={
+                            "bridge_profile": True,
+                            "overhang_risk": risk,
+                            "bridge_sag_strength": sag_strength,
+                            "bridge_anchor_left": bridge_start_x,
+                            "bridge_anchor_right": bridge_end_x,
+                            "overhang_layer_factor": layer_factor,
+                            "overhang_angle_factor": angle_sag_factor,
+                            "overhang_cooling_factor": cooling_sag_factor,
+                            "overhang_speed_factor": speed_sag_factor,
+                            "overhang_support_factor": support_sag_factor,
+                        },
+                    )
                 )
             layers.append(layer)
         return layers
@@ -431,11 +493,14 @@ class PrintSimulationEngine:
                 (-sx / 2, sy / 2, z),
                 (-sx / 2, -sy / 2, z),
             ]
+            pressure_corners = corners[:-1]
             for side_index, (start, end) in enumerate(zip(corners[:-1], corners[1:])):
                 meta = {
                     "profile": "pressure",
                     "pa_low": low,
                     "pa_high": high,
+                    "pa_corners": pressure_corners,
+                    "pa_corner_radius": 0.42,
                     "corner_start": True,
                     "corner_end": True,
                     "side_index": side_index,
@@ -483,28 +548,43 @@ class PrintSimulationEngine:
             z = self.visual_layer_z(layer_index)
             height = self.visual_segment_height()
             layer = ToolpathLayer(z, layer_index)
+            next_z = self.visual_layer_z(layer_index + 1) if layer_index < 15 else z + self.default_layer_height * self.visual_z_scale
+            travel_z = z + 0.24
+            next_travel_z = next_z + 0.24
+            radius = 0.36
+            tower_a_seam = (centers[0][0] + radius, centers[0][1], z)
+            tower_b_seam = (centers[1][0] - radius, centers[1][1], z)
+            tower_a_travel = (tower_a_seam[0], tower_a_seam[1], travel_z)
+            tower_b_travel = (tower_b_seam[0], tower_b_seam[1], travel_z)
+            tower_a_next_travel = (tower_a_seam[0], tower_a_seam[1], next_travel_z)
+            start_blob = clamp(stringing - 0.20, 0.0, 1.0)
             self.add_circle_layer(
                 layer,
                 centers[0][0],
                 centers[0][1],
                 z,
-                radius=0.36,
+                radius=radius,
                 width=0.20,
                 height=height,
-                points=24,
+                points=28,
                 start_angle=0.0,
-                meta={"tower": "first", "layer_index": layer_index},
+                meta={
+                    "tower": "first",
+                    "layer_index": layer_index,
+                    "restart_gap_risk": gap if layer_index > 0 else 0.0,
+                    "restart_blob_risk": start_blob if layer_index > 0 else 0.0,
+                    "restart_total_length": 2 * math.pi * radius,
+                },
             )
-            travel_z = z + 0.24
             travel = ToolpathSegment(
-                (-1.44, 0.0, travel_z),
-                (1.44, 0.0, travel_z),
+                tower_a_travel,
+                tower_b_travel,
                 0.05,
                 0.03,
                 "travel",
                 "#dfe7ef",
                 defect_strength=stringing,
-                meta={"stringing_risk": stringing, "layer_index": layer_index},
+                meta={"stringing_risk": stringing, "layer_index": layer_index, "travel_direction": "A_to_B"},
             )
             layer.segment_list.append(travel)
             self.add_circle_layer(
@@ -512,19 +592,30 @@ class PrintSimulationEngine:
                 centers[1][0],
                 centers[1][1],
                 z,
-                radius=0.36,
+                radius=radius,
                 width=0.20,
                 height=height,
-                points=24,
+                points=28,
                 start_angle=math.pi,
                 meta={
                     "tower": "second",
                     "layer_index": layer_index,
                     "restart_gap_risk": gap,
-                    "restart_blob_risk": clamp(stringing - 0.22, 0.0, 1.0),
-                    "restart_total_length": 2 * math.pi * 0.36,
+                    "restart_blob_risk": start_blob,
+                    "restart_total_length": 2 * math.pi * radius,
                 },
             )
+            return_travel = ToolpathSegment(
+                tower_b_travel,
+                tower_a_next_travel,
+                0.05,
+                0.03,
+                "travel",
+                "#dfe7ef",
+                defect_strength=stringing,
+                meta={"stringing_risk": stringing * 0.85, "layer_index": layer_index, "travel_direction": "B_to_A"},
+            )
+            layer.segment_list.append(return_travel)
             layers.append(layer)
         return layers
 
@@ -534,7 +625,18 @@ class PrintSimulationEngine:
         ratio = result["ratio"]
         line_width = float(params.get("line_width", 0.45))
         layer_height = float(params.get("layer_height", 0.20))
-        visual_width = lerp(0.18, 0.32, clamp((line_width - 0.35) / 0.45, 0, 1)) * lerp(1.0, 0.55, smoothstep(risk))
+        nozzle_diameter = result["nozzle_diameter"]
+        line_to_nozzle_ratio = result["line_to_nozzle_ratio"]
+        nozzle_visual_factor = lerp(0.92, 1.24, clamp((nozzle_diameter - 0.4) / 0.4, 0.0, 1.0))
+        line_visual_width = lerp(0.18, 0.34, clamp((line_width - 0.32) / 0.52, 0, 1))
+        flow_load = smoothstep(clamp((ratio - 0.75) / 0.75, 0.0, 1.0))
+        visual_width = line_visual_width * nozzle_visual_factor * lerp(1.0, 0.74, flow_load)
+        flow_meta = {
+            "flow_ratio": ratio,
+            "flow_risk": risk,
+            "nozzle_diameter": nozzle_diameter,
+            "line_to_nozzle_ratio": line_to_nozzle_ratio,
+        }
         layers = []
         for layer_index in range(10):
             z = self.visual_layer_z(layer_index, layer_height)
@@ -543,10 +645,11 @@ class PrintSimulationEngine:
             for line_index, y in enumerate(np.linspace(-0.82, 0.82, 5)):
                 start_x = -2.8
                 end_x = 2.8
+                meta = dict(flow_meta, line_index=line_index, layer_index=layer_index)
                 if ratio <= 1.0:
-                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height, "extrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk, "line_index": line_index, "layer_index": layer_index}))
+                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height, "extrusion", "#ff8a3d", defect_strength=risk, meta=meta))
                 else:
-                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height * 0.78, "underextrusion", "#ff8a3d", defect_strength=risk, meta={"flow_ratio": ratio, "flow_risk": risk, "line_index": line_index, "layer_index": layer_index}))
+                    layer.segment_list.append(ToolpathSegment((start_x, y, z), (end_x, y, z), visual_width, height * 0.78, "underextrusion", "#ff8a3d", defect_strength=risk, meta=meta))
             layers.append(layer)
         return layers
 
@@ -560,35 +663,41 @@ class FDMModel:
         fan = float(params.get("fan", 70))
         speed = float(params.get("speed", 55))
         support = bool(params.get("support", False))
-        angle_factor = clamp((angle - 45) / 35, 0, 1)
-        fan_factor = 1 - fan / 100
-        speed_factor = clamp((speed - 40) / 80, 0, 1)
-        support_factor = 0.35 if support else 1.0
-        return clamp((0.55 * angle_factor + 0.30 * fan_factor + 0.15 * speed_factor) * support_factor, 0, 1)
+        angle_factor = smoothstep(clamp((angle - 45) / 35, 0, 1))
+        fan_factor = smoothstep(1 - fan / 100)
+        speed_factor = smoothstep(clamp((speed - 40) / 80, 0, 1))
+        support_factor = 0.25 if support else 1.0
+        base_risk = 0.55 * angle_factor + 0.30 * fan_factor + 0.15 * speed_factor
+        return clamp(base_risk * support_factor, 0, 1)
 
     @staticmethod
     def pressure_advance_quality(params):
-        pa = float(params.get("pa", 0.05))
+        pa = clamp(float(params.get("pa", 0.05)), PA_SLIDER_MIN, PA_SLIDER_MAX)
         extruder = params.get("extruder", "Direct Drive")
         speed = float(params.get("speed", 80))
-        if extruder == "Direct Drive":
-            ideal = 0.05
-            tolerance = 0.08
-        else:
-            ideal = 0.35
-            tolerance = 0.18
-        speed_factor = clamp((speed - 60) / 120, 0, 1)
-        effective_tolerance = tolerance * (1 - 0.35 * speed_factor)
+        profile = PRESSURE_ADVANCE_SETTINGS.get(extruder, PRESSURE_ADVANCE_SETTINGS["Direct Drive"])
+        ideal = profile["ideal"]
+        tolerance = profile["tolerance"]
+        speed_factor = clamp((speed - 30) / (180 - 30), 0.0, 1.0)
+        effective_tolerance = tolerance * (1.0 - 0.35 * speed_factor)
+        defect_amplifier = 1.0 + 0.75 * speed_factor
         distance = abs(pa - ideal)
-        quality = clamp(1 - distance / max(effective_tolerance, 0.001), 0, 1)
-        low_pa_defect = clamp((ideal - pa) / max(effective_tolerance, 0.001), 0, 1)
-        high_pa_defect = clamp((pa - ideal) / max(effective_tolerance, 0.001), 0, 1)
+        quality = clamp(1.0 - (distance / max(effective_tolerance, 0.001)) ** 1.4, 0.0, 1.0)
+        defect_span = max(effective_tolerance * PA_DEFECT_SPAN_MULTIPLIER, 0.001)
+        base_low_pa_defect = smoothstep(clamp((ideal - pa) / defect_span, 0.0, 1.0))
+        base_high_pa_defect = smoothstep(clamp((pa - ideal) / defect_span, 0.0, 1.0))
+        low_pa_defect = clamp(base_low_pa_defect * defect_amplifier, 0.0, 1.0)
+        high_pa_defect = clamp(base_high_pa_defect * defect_amplifier, 0.0, 1.0)
         return {
             "quality": quality,
             "low_pa_defect": low_pa_defect,
             "high_pa_defect": high_pa_defect,
             "ideal": ideal,
             "effective_tolerance": effective_tolerance,
+            "pa": pa,
+            "speed": speed,
+            "speed_factor": speed_factor,
+            "defect_amplifier": defect_amplifier,
         }
 
     @staticmethod
@@ -609,17 +718,16 @@ class FDMModel:
         temperature = float(params.get("temperature", 205))
         travel_speed = float(params.get("travel_speed", 160))
         extruder = params.get("extruder", "Direct Drive")
-        if extruder == "Direct Drive":
-            ideal = 1.0
-            tolerance = 0.8
-        else:
-            ideal = 4.5
-            tolerance = 1.5
-        temp_factor = clamp((temperature - 200) / 60, 0, 1)
-        travel_factor = 1 - clamp((travel_speed - 50) / 200, 0, 1)
-        under_retract = clamp((ideal - retraction) / tolerance, 0, 1)
-        over_retract = clamp((retraction - ideal) / tolerance, 0, 1)
-        stringing_risk = clamp(0.50 * under_retract + 0.30 * temp_factor + 0.20 * travel_factor, 0, 1)
+        profile = RETRACTION_SETTINGS.get(extruder, RETRACTION_SETTINGS["Direct Drive"])
+        ideal = profile["ideal"]
+        safe_min = profile["safe_min"]
+        safe_max = profile["safe_max"]
+        under_retract = smoothstep(clamp((safe_min - retraction) / max(safe_min, 0.001), 0.0, 1.0))
+        over_retract = smoothstep(clamp((retraction - safe_max) / max(profile["over_span"], 0.001), 0.0, 1.0))
+        temp_factor = smoothstep(clamp((temperature - 215) / 45, 0.0, 1.0))
+        travel_factor = smoothstep(clamp((170 - travel_speed) / 120, 0.0, 1.0))
+        base_stringing = 0.72 * under_retract + 0.18 * temp_factor + 0.10 * travel_factor
+        stringing_risk = clamp(base_stringing * (1.0 - 0.68 * over_retract), 0.0, 1.0)
         restart_gap_risk = clamp(over_retract, 0, 1)
         combined_risk = max(stringing_risk, restart_gap_risk)
         return {
@@ -627,7 +735,10 @@ class FDMModel:
             "restart_gap_risk": restart_gap_risk,
             "combined_risk": combined_risk,
             "ideal": ideal,
-            "tolerance": tolerance,
+            "safe_min": safe_min,
+            "safe_max": safe_max,
+            "under_retract": under_retract,
+            "over_retract": over_retract,
         }
 
     @staticmethod
@@ -636,10 +747,23 @@ class FDMModel:
         line_width = float(params.get("line_width", 0.45))
         print_speed = float(params.get("print_speed", 70))
         max_flow = float(params.get("max_flow", 12))
+        nozzle_diameter = float(params.get("nozzle_diameter", 0.4))
         flow = layer_height * line_width * print_speed
         ratio = flow / max(max_flow, 0.001)
-        risk = clamp((ratio - 0.65) / 0.55, 0, 1)
-        return {"flow": flow, "ratio": ratio, "risk": risk}
+        line_to_nozzle_ratio = line_width / max(nozzle_diameter, 0.001)
+        low_line_ratio_risk = smoothstep(clamp((FLOW_REASONABLE_LINE_RATIO_MIN - line_to_nozzle_ratio) / 0.28, 0.0, 1.0)) * 0.10
+        high_line_ratio_risk = smoothstep(clamp((line_to_nozzle_ratio - FLOW_REASONABLE_LINE_RATIO_MAX) / 0.45, 0.0, 1.0)) * 0.22
+        flow_risk = smoothstep(clamp((ratio - 0.75) / 0.55, 0, 1))
+        risk = clamp(flow_risk + low_line_ratio_risk + high_line_ratio_risk, 0, 1)
+        return {
+            "flow": flow,
+            "ratio": ratio,
+            "risk": risk,
+            "flow_risk": flow_risk,
+            "nozzle_diameter": nozzle_diameter,
+            "line_to_nozzle_ratio": line_to_nozzle_ratio,
+            "line_ratio_risk": clamp(low_line_ratio_risk + high_line_ratio_risk, 0, 1),
+        }
 
     @staticmethod
     def score_for_mode(mode, params):
@@ -665,17 +789,17 @@ class FDMModel:
         if mode == "overhang":
             risk = FDMModel.overhang_risk(params)
             if risk < 0.34:
-                return "Overhang güvenli görünüyor; fan ve hız ayarları bu açı için yeterli."
+                return "Bridge temiz gorunuyor; iki pilon arasindaki filament hatlari duze yakin kaliyor."
             if risk < 0.67:
-                return "Sarkma başlayabilir; fanı artırmak veya baskı hızını düşürmek yardımcı olur."
-            return "Sarkma riski yüksek; support, daha güçlü fan veya daha düşük hız önerilir."
+                return "Bridge ortasinda hafif Z sarkmasi basliyor; fan ve hiz etkisi sahnede okunur."
+            return "Yuksek bridge riski var; boslugun ortasi asagi deforme olur, support sarkmayi guclu azaltir."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
-                return "PA değeri idealin altında; köşelerde blob ve şişme görülebilir."
+                return "PA idealin altında; hız arttıkça köşe blob/şişme etkisi belirginleşir."
             if result["high_pa_defect"] > 0.33:
-                return "PA fazla; köşe yakınlarında incelme veya küçük boşluklar oluşabilir."
-            return "PA ideal aralığa yakın; köşe basıncı daha dengeli görünür."
+                return "PA fazla; yüksek hızda köşe yakınında incelme veya küçük gap daha görünür olur."
+            return "PA ideal aralığa yakın; hız yükselse de köşe basıncı dengeli kalır."
         if mode == "input":
             if params.get("shaper", "MZV") == "Kapalı":
                 return "Input shaping kapalıyken hız ve ivme arttıkça ringing izleri belirginleşir."
@@ -690,10 +814,10 @@ class FDMModel:
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] <= 0.75:
-                return "Hotend bu debiyi rahat karşılıyor; ekstrüzyon çizgisi dolu görünür."
+                return "Hotend bu debiyi rahat karsiliyor; bead dolu, nozzle/line oranina gore olceklenir."
             if result["ratio"] <= 1.0:
-                return "Flow hotend limitine yaklaşıyor; küçük bir güvenlik payı bırakmak iyi olur."
-            return "Hotend kapasitesi aşılıyor; çizgide incelme ve düzenli kopmalar görülebilir."
+                return "Flow limite yaklasiyor; bead hafif incelir ama cizgi cogunlukla sureklidir."
+            return "Hotend kapasitesi asiliyor; bead cizilirken organik incelme ve kisa bosluklar olusur."
         return ""
 
     @staticmethod
@@ -701,20 +825,31 @@ class FDMModel:
         if mode == "intro":
             return "Soldan bir mod seç, parametreleri değiştir ve 3D sahnedeki temsili sonucu izle."
         if mode == "overhang":
-            return "Sarkma varsa fanı artır, hızı azalt veya support kullan. ABS gibi malzemelerde fan notunu ayrıca değerlendir."
+            return "Bridge sarkiyorsa fani artir, hizi azalt veya support kullan; deformasyon boslugun ortasindaki Z dususuyle temsil edilir."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
-                return "Köşe şişiyorsa PA değerini küçük adımlarla artır."
+                return "Köşelerde şişme varsa PA değerini küçük adımlarla artır; yüksek hız PA toleransını daraltır."
             if result["high_pa_defect"] > 0.33:
-                return "Köşe öncesi boşluk varsa PA değerini azalt."
-            return "Bu aralık iyi görünüyor; farklı hızlarda küçük test baskısıyla doğrula."
+                return "Köşe öncesi boşluk/incelme varsa PA değerini azalt; hız düşürmek hatayı yumuşatır."
+            return "PA aralığı iyi görünüyor; hız arttıkça tolerans daraldığı için hızlı testlerle de doğrula."
         if mode == "input":
             return "Ringing belirginse acceleration azalt veya MZV/EI/2HUMP_EI shaper tiplerini karşılaştır."
         if mode == "retraction":
-            return "Stringing varsa retraction, sıcaklık ve travel hızını birlikte ayarla; gap varsa retraction mesafesini azalt."
+            result = FDMModel.retraction_stringing_risk(params)
+            if result["restart_gap_risk"] > 0.35:
+                return "Restart gap varsa retraction mesafesini azalt."
+            if result["stringing_risk"] > 0.35:
+                return "Stringing varsa retraction mesafesini artır, sıcaklığı düşür veya travel hızını artır."
+            return "Retraction dengeli görünüyor."
         if mode == "flow":
-            return "Debi yüksekse hız, layer height veya line width azaltılabilir."
+            result = FDMModel.volumetric_flow_risk(params)
+            line_ratio = result["line_to_nozzle_ratio"]
+            if line_ratio < FLOW_REASONABLE_LINE_RATIO_MIN:
+                return "Line width nozzle capina gore dusuk; yuzey kaplama zayif temsil edilebilir."
+            if line_ratio > FLOW_REASONABLE_LINE_RATIO_MAX:
+                return "Line width nozzle capina gore yuksek; akis yuku ve kalite riski artabilir."
+            return "Debi yuksekse hiz, layer height veya line width azaltilabilir; 0.9x-1.4x nozzle araligi makul kabul edilir."
         return ""
 
     @staticmethod
@@ -722,35 +857,35 @@ class FDMModel:
         if mode == "intro":
             return "Temsil notu: 3D sahne eğitim amaçlı ölçeklendirilmiştir; gerçek fizik motoru kullanılmaz."
         if mode == "overhang":
-            return "Risk = açı, fan, hız ve support etkilerinin ağırlıklı toplamı."
+            return "Sag = max_sag * bridge_risk * mid_span_factor^1.4; support riski ciddi azaltir."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
-            return f"İdeal PA: {result['ideal']:.2f}, tolerans: ±{result['effective_tolerance']:.2f}."
+            return f"İdeal PA: {result['ideal']:.3f}, efektif tolerans: ±{result['effective_tolerance']:.3f}, hız çarpanı: {result['defect_amplifier']:.2f}x."
         if mode == "input":
             return "Dalga = amplitude × sin(2πx / wavelength) × exp(-decay × x)."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
-            return f"İdeal retraction: {result['ideal']:.1f} mm; üstünde restart gap, altında stringing artar."
+            return f"İdeal retraction: {result['ideal']:.1f} mm; güvenli aralık {result['safe_min']:.1f}-{result['safe_max']:.1f} mm."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"Flow = Layer Height × Line Width × Speed = {result['flow']:.2f} mm³/s."
+            return f"Flow = Layer Height x Line Width x Speed = {result['flow']:.2f} mm3/s; LW/ND = {result['line_to_nozzle_ratio']:.2f}x."
         return ""
 
     @staticmethod
     def calculated_value_text(mode, params):
         if mode == "overhang":
-            return f"Sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
+            return f"Bridge sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
-            return f"PA kalite: {result['quality'] * 100:.0f}% | ideal {result['ideal']:.2f}"
+            return f"PA {result['pa']:.3f} | ideal {result['ideal']:.3f} | hız {result['speed']:.0f} mm/s | tolerans ±{result['effective_tolerance']:.3f}"
         if mode == "input":
             return f"Ringing riski: {FDMModel.input_shaping_risk(params) * 100:.0f}%"
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
-            return f"Stringing {result['stringing_risk'] * 100:.0f}% | Gap {result['restart_gap_risk'] * 100:.0f}%"
+            return f"Stringing {result['stringing_risk'] * 100:.0f}% | Restart gap {result['restart_gap_risk'] * 100:.0f}%"
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"{result['flow']:.2f} / {float(params.get('max_flow', 12)):.1f} mm³/s | Ratio {result['ratio']:.2f}"
+            return f"Flow {result['flow']:.2f} / {float(params.get('max_flow', 12)):.1f} mm3/s | Ratio {result['ratio']:.2f} | Nozzle {result['nozzle_diameter']:.1f} | LW/ND {result['line_to_nozzle_ratio']:.2f}x"
         return "3D öğretici görünüm hazır"
 
     @staticmethod
@@ -759,12 +894,16 @@ class FDMModel:
             result = FDMModel.pressure_advance_quality(params)
             return [("Köşe kalite skoru", result["quality"], False)]
         if mode == "overhang":
-            return [("Sarkma riski", FDMModel.overhang_risk(params), True)]
+            return [("Bridge sarkma riski", FDMModel.overhang_risk(params), True)]
         if mode == "input":
             return [("Ringing riski", FDMModel.input_shaping_risk(params), True)]
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
-            return [("Genel risk", result["combined_risk"], True)]
+            return [
+                ("Stringing riski", result["stringing_risk"], True),
+                ("Restart gap riski", result["restart_gap_risk"], True),
+                ("Genel risk", result["combined_risk"], True),
+            ]
         if mode == "flow":
             return [("Hotend limit riski", FDMModel.volumetric_flow_risk(params)["risk"], True)]
         return [("Rehber tamamlık", 0.88, False)]
@@ -866,7 +1005,7 @@ class GLSceneWidget(QWidget):
         mode = mode or self.state.active_mode
         presets = {
             "intro": ((0, 0, 4.0), 155.0, 28, -42),
-            "overhang": ((6, 0, 4.5), 165.0, 20, -66),
+            "overhang": ((0, 0, 3.0), 142.0, 17, -74),
             "pressure": ((0, 0, 3.2), 150.0, 50, -40),
             "input": ((0, -1.8, 4.8), 138.0, 22, -74),
             "retraction": ((0, 0, 4.8), 155.0, 28, -42),
@@ -1051,6 +1190,13 @@ class GLSceneWidget(QWidget):
 
     def corner_profile_influence(self, sample, zone=0.18):
         segment = sample["segment"]
+        if segment.meta.get("profile") == "pressure" and segment.meta.get("pa_corners"):
+            point = np.asarray(sample["point"], dtype=float)
+            corners = [np.asarray(corner, dtype=float) for corner in segment.meta.get("pa_corners", [])]
+            if corners:
+                distance = min(float(np.linalg.norm(point[:2] - corner[:2])) for corner in corners)
+                radius = max(float(segment.meta.get("pa_corner_radius", zone)), 0.001)
+                return smoothstep(1.0 - distance / radius)
         local = sample["local_progress"]
         influence = 0.0
         if segment.meta.get("corner_start", False):
@@ -1081,11 +1227,14 @@ class GLSceneWidget(QWidget):
             if ratio <= 0.75 and segment.segment_type != "underextrusion":
                 continue
             risk = clamp(float(meta.get("flow_risk", segment.defect_strength)), 0.0, 1.0)
+            line_to_nozzle_ratio = float(meta.get("line_to_nozzle_ratio", 1.0))
             severity = clamp((ratio - 0.75) / 0.75, 0.0, 1.0)
+            high_line_load = smoothstep(clamp((line_to_nozzle_ratio - FLOW_REASONABLE_LINE_RATIO_MAX) / 0.55, 0.0, 1.0))
             seed = int(meta.get("line_index", 0)) * 37 + int(meta.get("layer_index", 0)) * 19
             noise = self.deterministic_noise(index, seed)
-            slow_pulse = 0.5 + 0.5 * math.sin(2 * math.pi * (sample["visible_progress"] * 2.7 + noise * 0.33))
-            thinning = severity * (0.10 + 0.22 * noise + 0.12 * slow_pulse) + risk * 0.08
+            noise_b = self.deterministic_noise(index * 3 + 17, seed + 53)
+            slow_pulse = 0.5 + 0.5 * math.sin(2 * math.pi * (sample["visible_progress"] * (1.7 + noise_b * 2.2) + noise * 0.41))
+            thinning = severity * (0.07 + 0.20 * noise + 0.16 * slow_pulse) + risk * 0.05 + high_line_load * 0.10
             modifiers[index] *= max(0.24, 1.0 - thinning)
         return modifiers
 
@@ -1128,19 +1277,22 @@ class GLSceneWidget(QWidget):
             near_start = sample["local_progress"] < 0.055
             near_end = sample["local_progress"] > 0.945
             corner_key = (sample["segment_index"], "start" if near_start else "end")
-            if high > 0.68 and influence > 0.72 and (near_start or near_end) and corner_key not in pressure_gap_added:
-                gaps.append(self.sample_gap_range(samples, index, total, 0.58 + high * 0.20))
+            if high > 0.78 and influence > 0.78 and (near_start or near_end) and corner_key not in pressure_gap_added:
+                gaps.append(self.sample_gap_range(samples, index, total, 0.46 + high * 0.18))
                 pressure_gap_added.add(corner_key)
 
             ratio = float(meta.get("flow_ratio", 0.0))
             if ratio > 1.0:
                 risk = clamp(float(meta.get("flow_risk", segment.defect_strength)), 0.0, 1.0)
+                line_to_nozzle_ratio = float(meta.get("line_to_nozzle_ratio", 1.0))
+                high_line_load = smoothstep(clamp((line_to_nozzle_ratio - FLOW_REASONABLE_LINE_RATIO_MAX) / 0.55, 0.0, 1.0))
                 seed = int(meta.get("line_index", 0)) * 41 + int(meta.get("layer_index", 0)) * 23
-                noise = self.deterministic_noise(index, seed)
-                gap_probability = clamp((ratio - 1.0) * 0.075 + risk * 0.055, 0.0, 0.16)
+                noise = self.deterministic_noise(index * 5 + 11, seed)
+                local_cluster = self.deterministic_noise(int(sample["visible_progress"] * 31), seed + 71)
+                gap_probability = clamp((ratio - 1.0) * 0.095 + risk * 0.050 + high_line_load * 0.035, 0.0, 0.22)
                 away_from_ends = 0.035 < sample["visible_progress"] < 0.965
-                if away_from_ends and noise < gap_probability:
-                    gaps.append(self.sample_gap_range(samples, index, total, 0.48 + risk * 0.35))
+                if away_from_ends and noise < gap_probability * (0.55 + local_cluster):
+                    gaps.append(self.sample_gap_range(samples, index, total, 0.36 + risk * 0.30 + high_line_load * 0.12))
 
         restart_segments = [sample for sample in samples if float(sample["segment"].meta.get("restart_gap_risk", 0.0)) > 0.14]
         if restart_segments:
@@ -1158,12 +1310,29 @@ class GLSceneWidget(QWidget):
             risk = clamp(float(meta.get("overhang_risk", 0.0)), 0.0, 1.0)
             if risk <= 0.01:
                 continue
+            if meta.get("bridge_profile", False):
+                left_anchor = float(meta.get("bridge_anchor_left", sample["point"][0]))
+                right_anchor = float(meta.get("bridge_anchor_right", left_anchor + 0.001))
+                anchor_min = min(left_anchor, right_anchor)
+                anchor_max = max(left_anchor, right_anchor)
+                layer_factor = clamp(float(meta.get("overhang_layer_factor", 1.0)), 0.0, 1.0)
+                span_progress = clamp((sample["point"][0] - anchor_min) / max(anchor_max - anchor_min, 0.001), 0.0, 1.0)
+                mid_span_factor = max(0.0, math.sin(math.pi * span_progress))
+                sag_strength = clamp(float(meta.get("bridge_sag_strength", risk)), 0.0, 1.0)
+                max_sag = 0.055 + 0.155 * layer_factor
+                offsets[index] -= sag_strength * (mid_span_factor ** 1.40) * max_sag
+                continue
             root_x = float(meta.get("overhang_root_x", sample["point"][0]))
             tip_x = float(meta.get("overhang_tip_x", root_x + 0.001))
             layer_factor = clamp(float(meta.get("overhang_layer_factor", 1.0)), 0.0, 1.0)
+            angle_factor = clamp(float(meta.get("overhang_angle_factor", risk)), 0.0, 1.0)
+            cooling_factor = clamp(float(meta.get("overhang_cooling_factor", 0.0)), 0.0, 1.0)
+            speed_factor = clamp(float(meta.get("overhang_speed_factor", 0.0)), 0.0, 1.0)
+            support_factor = clamp(float(meta.get("overhang_support_factor", 1.0)), 0.0, 1.0)
             free_end_factor = clamp((sample["point"][0] - root_x) / max(tip_x - root_x, 0.001), 0.0, 1.0)
-            max_sag = 0.045 + 0.075 * layer_factor
-            offsets[index] -= risk * (free_end_factor ** 1.55) * max_sag
+            sag_driver = clamp(0.72 * angle_factor + 0.18 * cooling_factor + 0.10 * speed_factor, 0.0, 1.0)
+            max_sag = 0.030 + 0.125 * layer_factor
+            offsets[index] -= max(risk, sag_driver * 0.35 * support_factor) * (free_end_factor ** 1.55) * max_sag
         return offsets
 
     def corner_strength(self, previous, current, following):
@@ -1498,6 +1667,19 @@ class GLSceneWidget(QWidget):
         edge = "#a65228" if partial.segment_type != "support" else "#438eb8"
         self.add_item(self.mesh_item(vertexes, faces, partial.color, alpha, edge))
 
+    def draw_support_column(self, segment, progress=1.0):
+        partial = segment.partial(progress) if progress < 0.999 else segment
+        start = self.scene_point(partial.start)
+        end = self.scene_point(partial.end)
+        z0 = min(start[2], end[2])
+        z1 = max(start[2], end[2])
+        if z1 - z0 < 0.05:
+            return
+        size_x = max(0.95, float(segment.meta.get("support_size_x", 0.16)) * PART_SCALE)
+        size_y = max(3.2, float(segment.meta.get("support_size_y", 0.92)) * PART_SCALE)
+        center = (start[0], start[1], (z0 + z1) * 0.5)
+        self.add_box(center=center, size=(size_x, size_y, z1 - z0), color=segment.color, alpha=0.26, edge="#438eb8")
+
     def draw_bead_run(self, run):
         if not run:
             return
@@ -1532,30 +1714,36 @@ class GLSceneWidget(QWidget):
 
     def draw_travel_stringing(self, segment, progress=1.0):
         risk = clamp(float(segment.meta.get("stringing_risk", 0.0)), 0.0, 1.0)
-        if risk <= 0.04:
+        if risk < 0.15:
             return
-        count = int(round(lerp(1, 6, risk)))
-        count = max(1, min(6, count))
+        if risk < 0.30:
+            count = 1
+        else:
+            count = max(3, int(round(risk * 6)))
+        count = min(6, count)
         start = np.asarray(segment.start, dtype=float)
         end = np.asarray(segment.end, dtype=float)
         layer_seed = int(segment.meta.get("layer_index", 0))
         for index in range(count):
             centered = index - (count - 1) / 2
-            y_offset = centered * lerp(0.035, 0.075, risk)
+            y_offset = centered * lerp(0.018, 0.055, risk)
             start_jitter = (self.deterministic_noise(index, layer_seed) - 0.5) * 0.025
             end_jitter = (self.deterministic_noise(index + 11, layer_seed) - 0.5) * 0.025
-            sag = lerp(0.015, 0.100, risk) * (0.7 + 0.2 * abs(centered))
+            sag = lerp(0.018, 0.085, risk) * (0.75 + 0.16 * abs(centered))
             curve = [
-                start + np.asarray((0.00, y_offset + start_jitter, -0.15), dtype=float),
-                (start + end) * 0.5 + np.asarray((0.0, y_offset * 0.35, -0.20 - sag), dtype=float),
-                end + np.asarray((0.00, y_offset * 0.45 + end_jitter, -0.16), dtype=float),
+                start + np.asarray((0.00, y_offset + start_jitter, -0.18), dtype=float),
+                (start + end) * 0.5 + np.asarray((0.0, y_offset * 0.38, -0.22 - sag), dtype=float),
+                end + np.asarray((0.00, y_offset * 0.45 + end_jitter, -0.18), dtype=float),
             ]
             partial = partial_polyline3d(curve, progress)
             if len(partial) >= 2:
-                alpha = 0.18 + risk * 0.42
-                self.add_line([self.scene_point(point) for point in partial], "#f6ead0", 0.62, alpha)
+                alpha = 0.24 if risk < 0.30 else lerp(0.35, 0.55, risk)
+                self.add_line([self.scene_point(point) for point in partial], "#ffbf7a", 0.50, alpha)
 
     def draw_segment(self, segment, progress=1.0, active=False):
+        if segment.segment_type == "support_column":
+            self.draw_support_column(segment, progress if active else 1.0)
+            return
         if segment.segment_type == "travel":
             if active:
                 partial = segment.partial(progress)
@@ -1584,6 +1772,10 @@ class GLSceneWidget(QWidget):
     def add_nozzle(self, tip):
         tip = self.scene_point(tip) + np.array((0.0, 0.0, self.scene_height(self.engine.visual_segment_height()) * 0.72))
         ns = NOZZLE_SCALE
+        if self.state.active_mode == "flow":
+            flow_result = FDMModel.volumetric_flow_risk(self.state.current_params())
+            nozzle_diameter = float(flow_result["nozzle_diameter"])
+            ns *= lerp(0.88, 1.28, clamp((nozzle_diameter - 0.4) / 0.4, 0.0, 1.0))
         self.add_cone(tip, radius=2.35 * ns, height=6.20 * ns, color="#dbe2ea", alpha=1.0)
         self.add_cylinder(center=(tip[0], tip[1], tip[2] + 0.42 * ns), radius=0.48 * ns, height=0.90 * ns, color="#29323a", alpha=1.0, segments=16)
         self.add_box(center=(tip[0], tip[1], tip[2] + 7.60 * ns), size=(6.40 * ns, 5.20 * ns, 3.20 * ns), color="#7f8c98", alpha=1.0, edge="#d7e0e8")
@@ -1657,7 +1849,7 @@ class ParameterPanel(QWidget):
         if self.state.active_mode == "intro":
             self.build_intro_panel()
         elif self.state.active_mode == "overhang":
-            self.add_help("Açı, fan, hız ve support durumunun overhang sarkmasına etkisini gösterir.")
+            self.add_help("İki pilon arasındaki bridge çizgilerinde fan, hız ve support sarkma miktarını değiştirir.")
             self.build_overhang_controls()
         elif self.state.active_mode == "pressure":
             self.add_help("Pressure Advance köşe basıncı, blob ve gap davranışını temsili olarak gösterir.")
@@ -1731,16 +1923,16 @@ class ParameterPanel(QWidget):
         slider.setValue(int(round((current - min_value) / step)))
         slider.setToolTip(tooltip)
 
+        decimals = 0 if step >= 1 else 1 if step >= 0.1 else 2 if step >= 0.01 else 3
+
         def format_value(value):
-            if step >= 1:
+            if decimals == 0:
                 return f"{int(round(value))} {unit}".strip()
-            if step >= 0.1:
-                return f"{value:.1f} {unit}".strip()
-            return f"{value:.2f} {unit}".strip()
+            return f"{value:.{decimals}f} {unit}".strip()
 
         def update_value(slider_value):
             value = clamp(min_value + slider_value * step, min_value, max_value)
-            value = int(round(value)) if step >= 1 else round(value, 2)
+            value = int(round(value)) if decimals == 0 else round(value, decimals)
             value_label.setText(format_value(value))
             self.state.update_parameter(key, value)
             self.parameters_changed.emit()
@@ -1789,13 +1981,13 @@ class ParameterPanel(QWidget):
         self.layout.addWidget(frame)
 
     def build_overhang_controls(self):
-        self.add_slider("Overhang açısı", "angle", 20, 80, 1, "derece", "Açı büyüdükçe sarkma riski artar.")
-        self.add_slider("Fan hızı", "fan", 0, 100, 1, "%", "Plastiğin soğuma hızını temsil eder.")
-        self.add_slider("Baskı hızı", "speed", 20, 120, 1, "mm/s", "Overhang bölgelerinde yüksek hız yerleşimi zorlaştırabilir.")
-        self.add_checkbox("Support kullan", "support", "Desteksiz bölgenin altına geçici destek eklenmesini temsil eder.")
+        self.add_slider("Bridge zorluğu", "angle", 20, 80, 1, "derece", "Yüksek değer daha zor bridge koşulunu temsil eder.")
+        self.add_slider("Fan hızı", "fan", 0, 100, 1, "%", "Bridge filamentinin ne kadar hızlı soğuduğunu temsil eder.")
+        self.add_slider("Baskı hızı", "speed", 20, 120, 1, "mm/s", "Bridge sırasında yüksek hız sarkmayı artırabilir.")
+        self.add_checkbox("Support kullan", "support", "Boşluğun altına geçici destek eklenmesini veya sag riskinin düşmesini temsil eder.")
 
     def build_pressure_controls(self):
-        self.add_slider("Pressure Advance", "pa", 0.00, 1.00, 0.01, "", "Köşe basıncını dengelemeyi temsil eder.")
+        self.add_slider("Pressure Advance", "pa", PA_SLIDER_MIN, PA_SLIDER_MAX, PA_SLIDER_STEP, "", "Köşe basıncını 0.005 adımlarla dengelemeyi temsil eder.")
         self.add_combo("Extruder tipi", "extruder", ["Direct Drive", "Bowden"], "Direct drive ve Bowden için ideal PA farklıdır.")
         self.add_slider("Baskı hızı", "speed", 30, 180, 1, "mm/s", "Hız arttıkça basınç değişimleri belirginleşir.")
 
