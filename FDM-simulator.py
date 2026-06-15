@@ -7,7 +7,7 @@ import numpy as np
 
 try:
     from PySide6.QtCore import Qt, QTimer, Signal
-    from PySide6.QtGui import QAction, QColor, QPixmap
+    from PySide6.QtGui import QAction, QColor, QPixmap, QSurfaceFormat
     from PySide6.QtWidgets import (
         QApplication,
         QButtonGroup,
@@ -35,25 +35,74 @@ except ImportError as exc:
 
 try:
     from pyqtgraph import Vector as PGVector
+    import pyqtgraph as pg
     import pyqtgraph.opengl as gl
 
     GL_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - dependency fallback
+    pg = None
     gl = None
     PGVector = None
     GL_IMPORT_ERROR = exc
 
 
-MODES = [
-    ("intro", "Ana Sayfa"),
-    ("overhang", "Bridge / Cooling"),
-    ("pressure", "Pressure Advance"),
-    ("input", "Input Shaping / Ringing"),
-    ("retraction", "Retraction / Stringing"),
-    ("flow", "Volumetric Flow"),
-]
+MODE_KEYS = ("intro", "overhang", "pressure", "input", "retraction", "flow")
+DEFAULT_TERM_MODE = "Açıklamalı"
+TERM_MODE_LABELS = {
+    "Açıklamalı": {
+        "intro": "Ana Sayfa",
+        "overhang": "Köprüleme / Soğutma",
+        "pressure": "Basınç Dengeleme (Pressure Advance)",
+        "input": "Titreşim Sönümleme / Ringing",
+        "retraction": "Geri Çekme / İpliklenme",
+        "flow": "Hacimsel Debi",
+    },
+    "Teknik": {
+        "intro": "Home",
+        "overhang": "Bridge / Cooling",
+        "pressure": "Pressure Advance",
+        "input": "Input Shaping / Ringing",
+        "retraction": "Retraction / Stringing",
+        "flow": "Volumetric Flow",
+    },
+}
 
+MODES = [(mode, TERM_MODE_LABELS[DEFAULT_TERM_MODE][mode]) for mode in MODE_KEYS]
 MODE_LABELS = dict(MODES)
+
+MODE_BUTTON_BREAKS = {
+    "Açıklamalı": {
+        "overhang": "Köprüleme /\nSoğutma",
+        "pressure": "Basınç Dengeleme\n(Pressure Advance)",
+        "input": "Titreşim Sönümleme\n/ Ringing",
+        "retraction": "Geri Çekme\n/ İpliklenme",
+    },
+    "Teknik": {
+        "overhang": "Bridge /\nCooling",
+        "input": "Input Shaping\n/ Ringing",
+        "retraction": "Retraction\n/ Stringing",
+    },
+}
+
+PRESET_DISPLAY_NAMES = {"PLA": "PLA", "PETG": "PETG", "ABS": "ABS", "Custom": "Özel"}
+PRESET_DISPLAY_TO_VALUE = {display: value for value, display in PRESET_DISPLAY_NAMES.items()}
+
+
+def mode_label(mode, term_mode=DEFAULT_TERM_MODE):
+    labels = TERM_MODE_LABELS.get(term_mode, TERM_MODE_LABELS[DEFAULT_TERM_MODE])
+    return labels.get(mode, MODE_LABELS.get(mode, mode))
+
+
+def mode_button_label(mode, term_mode=DEFAULT_TERM_MODE):
+    return MODE_BUTTON_BREAKS.get(term_mode, {}).get(mode, mode_label(mode, term_mode))
+
+
+def preset_display_name(preset_name):
+    return PRESET_DISPLAY_NAMES.get(preset_name, preset_name)
+
+
+def preset_internal_name(display_name):
+    return PRESET_DISPLAY_TO_VALUE.get(display_name, display_name)
 
 DEFAULT_PARAMETERS = {
     "intro": {},
@@ -96,6 +145,10 @@ Z_VISUAL_SCALE = 6.0
 LINE_WIDTH_VISUAL = 0.58
 LAYER_HEIGHT_VISUAL = 0.40
 NOZZLE_SCALE = 0.62
+BEAD_CROSS_SECTION_SEGMENTS = 14
+ROUND_GEOMETRY_SEGMENTS = 48
+BEAD_SAMPLE_STEP = 0.10
+RETRACTION_TOWER_POINTS = 48
 FLOW_REASONABLE_LINE_RATIO_MIN = 0.90
 FLOW_REASONABLE_LINE_RATIO_MAX = 1.40
 PA_SLIDER_MIN = 0.0
@@ -558,7 +611,7 @@ class PrintSimulationEngine:
                 radius=radius,
                 width=0.20,
                 height=height,
-                points=28,
+                points=RETRACTION_TOWER_POINTS,
                 start_angle=0.0,
                 meta={
                     "tower": "first",
@@ -587,7 +640,7 @@ class PrintSimulationEngine:
                 radius=radius,
                 width=0.20,
                 height=height,
-                points=28,
+                points=RETRACTION_TOWER_POINTS,
                 start_angle=math.pi,
                 meta={
                     "tower": "second",
@@ -762,8 +815,81 @@ class FDMModel:
         elif mode == "flow":
             risk = FDMModel.volumetric_flow_risk(params)["risk"]
         else:
-            return "Hazırlık Skoru", 0.88, 88, False
+            return "Durum", 0.0, 0, False
         return "Risk Skoru", risk, int(round(risk * 100)), True
+
+    @staticmethod
+    def score_level_text(score, is_risk):
+        if is_risk:
+            if score <= 33:
+                return "Düşük"
+            if score <= 66:
+                return "Orta"
+            return "Yüksek"
+        if score >= 80:
+            return "İyi"
+        if score >= 50:
+            return "Orta"
+        return "Zayıf"
+
+    @staticmethod
+    def score_display_text(mode, score_label, score, is_risk):
+        if mode == "intro":
+            return "Durum: Simülasyon hazır"
+        return f"{score_label}: {score}/100 - {FDMModel.score_level_text(score, is_risk)}"
+
+    @staticmethod
+    def formatted_parameter_lines(mode, params):
+        specs = {
+            "overhang": [
+                ("angle", "Köprü açıklığı", "mm"),
+                ("fan", "Fan hızı", "%"),
+                ("speed", "Baskı hızı", "mm/s"),
+                ("support", "Destek kullan", ""),
+            ],
+            "pressure": [
+                ("pa", "Pressure Advance", ""),
+                ("extruder", "Ekstruder tipi", ""),
+                ("speed", "Test hızı", "mm/s"),
+            ],
+            "input": [
+                ("acceleration", "İvme", "mm/s²"),
+                ("frequency", "Rezonans frekansı", "Hz"),
+                ("shaper", "Shaper tipi", ""),
+                ("speed", "Baskı hızı", "mm/s"),
+            ],
+            "retraction": [
+                ("retraction", "Geri çekme mesafesi", "mm"),
+                ("temperature", "Nozzle sıcaklığı", "°C"),
+                ("travel_speed", "Boşta hareket hızı (Travel)", "mm/s"),
+                ("extruder", "Ekstruder tipi", ""),
+            ],
+            "flow": [
+                ("layer_height", "Katman yüksekliği", "mm"),
+                ("line_width", "Çizgi genişliği", "mm"),
+                ("print_speed", "Baskı hızı", "mm/s"),
+                ("max_flow", "Hotend kapasitesi", "mm³/s"),
+                ("nozzle_diameter", "Nozzle çapı", "mm"),
+            ],
+        }
+
+        def format_value(value, unit):
+            if isinstance(value, bool):
+                return "Evet" if value else "Hayır"
+            if isinstance(value, float):
+                text = f"{value:.3f}" if abs(value) < 0.01 else f"{value:.2f}"
+                text = text.rstrip("0").rstrip(".")
+            else:
+                text = str(value)
+            return f"{text} {unit}".strip()
+
+        lines = []
+        for key, label, unit in specs.get(mode, []):
+            if key in params:
+                lines.append(f"- {label}: {format_value(params[key], unit)}")
+        if not lines:
+            lines.append("- Parametre yok")
+        return lines
 
     @staticmethod
     def explanation_text(mode, params):
@@ -772,35 +898,35 @@ class FDMModel:
         if mode == "overhang":
             risk = FDMModel.overhang_risk(params)
             if risk < 0.34:
-                return "Bridge temiz görünüyor; iki pylon arasındaki filament hatları düze yakın kalıyor."
+                return "Köprüleme temiz görünüyor; iki destek kulesi arasındaki filament hatları düz kalıyor."
             if risk < 0.67:
-                return "Bridge ortasında sarkma artıyor; fan ve hız etkisi sahnede okunur."
-            return "Yüksek bridge sarkma riski var; açıklık ortası aşağı deforme olur, support sarkmayı güçlü azaltır."
+                return "Köprü ortasında sarkma artıyor; fan ve baskı hızı etkisi sahnede okunur."
+            return "Yüksek köprü sarkma riski var; açıklık ortası aşağı deforme olur, destek sarkmayı azaltır."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
                 return "PA idealin altında; test hızı yükseldikçe köşe şişmesi daha belirgin görünür."
             if result["high_pa_defect"] > 0.33:
-                return "PA fazla; yüksek test hızında köşe incelmesi veya küçük gap daha görünür olur."
+                return "PA fazla; yüksek test hızında köşe incelmesi veya küçük boşluk daha görünür olur."
             return "PA ideal aralığa yakın; test hızı yükselse bile köşe davranışı dengeli kalır."
         if mode == "input":
             if params.get("shaper", "MZV") == "Kapalı":
-                return "Input shaping kapalıyken hız ve ivme arttıkça ringing izleri belirginleşir."
-            return "Input shaping titreşim izlerini azaltır; agresif shaper ayarları smoothing etkisi yaratabilir."
+                return "Titreşim sönümleme kapalıyken hız ve ivme arttıkça ringing izleri belirginleşir."
+            return "Titreşim sönümleme yüzeydeki ringing izlerini azaltır; agresif shaper ayarları yüzeyi yumuşatabilir."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
             if result["restart_gap_risk"] > 0.35:
-                return "Retraction fazla; ikinci kule başlangıcında restart gap görülebilir."
+                return "Geri çekme fazla; ikinci kule başlangıcında yeniden başlama boşluğu (restart gap) görülebilir."
             if result["stringing_risk"] > 0.35:
-                return "Retraction düşük veya sıcaklık yüksek; travel sırasında stringing artabilir."
-            return "Retraction değeri dengeli; travel sırasında sızıntı kontrollü görünüyor."
+                return "Geri çekme düşük veya sıcaklık yüksek; boşta hareket sırasında ipliklenme artabilir."
+            return "Geri çekme değeri dengeli; boşta hareket sırasında sızıntı kontrollü görünüyor."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] <= 0.75:
-                return "Hotend bu debiyi rahat karşılıyor; bead dolu, nozzle/line oranına göre ölçeklenir."
+                return "Hotend bu hacimsel debiyi rahat karşılıyor; ekstrüzyon hattı dolu görünüyor."
             if result["ratio"] <= 1.0:
-                return "Flow limite yaklaşıyor; bead hafif incelir ama çizgi çoğunlukla süreklidir."
-            return "Hotend kapasitesi aşılıyor; bead çizilirken organik incelme ve kısa boşluklar oluşur."
+                return "Hacimsel debi limite yaklaşıyor; ekstrüzyon hattı hafif incelir ama çoğunlukla süreklidir."
+            return "Hotend kapasitesi aşılıyor; ekstrüzyon hattında incelme ve kısa boşluklar oluşur."
         return ""
 
     @staticmethod
@@ -808,7 +934,7 @@ class FDMModel:
         if mode == "intro":
             return "Soldan bir mod seç, parametreleri değiştir ve 3D sahnedeki temsili sonucu izle."
         if mode == "overhang":
-            return "Bridge ortasında sarkma artıyorsa fanı artır, hızı azalt veya support kullan."
+            return "Köprü ortasında sarkma artıyorsa fanı artır, hızı azalt veya destek kullan."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
@@ -817,22 +943,22 @@ class FDMModel:
                 return "Köşe öncesi boşluk/incelme varsa PA değerini azalt; test hızını düşürmek hatayı yumuşatır."
             return "PA aralığı iyi görünüyor; test hızı arttıkça tolerans daraldığı için hızlı testlerle de doğrula."
         if mode == "input":
-            return "Ringing belirginse acceleration azalt veya MZV/EI/2HUMP_EI shaper tiplerini karşılaştır."
+            return "Ringing belirginse ivmeyi azalt veya MZV/EI/2HUMP_EI shaper tiplerini karşılaştır."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
             if result["restart_gap_risk"] > 0.35:
-                return "Restart gap varsa retraction mesafesini azalt."
+                return "Yeniden başlama boşluğu (restart gap) varsa geri çekme mesafesini azalt."
             if result["stringing_risk"] > 0.35:
-                return "Stringing varsa retraction mesafesini artır, sıcaklığı düşür veya travel hızını artır."
-            return "Retraction dengeli görünüyor."
+                return "İpliklenme varsa geri çekme mesafesini artır, sıcaklığı düşür veya boşta hareket hızını artır."
+            return "Geri çekme dengeli görünüyor."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             line_ratio = result["line_to_nozzle_ratio"]
             if line_ratio < FLOW_REASONABLE_LINE_RATIO_MIN:
-                return "Line width nozzle çapına göre düşük; yüzey kaplama zayıf temsil edilebilir."
+                return "Çizgi genişliği nozzle çapına göre düşük; yüzey kaplama zayıf temsil edilebilir."
             if line_ratio > FLOW_REASONABLE_LINE_RATIO_MAX:
-                return "Line width nozzle çapına göre yüksek; akış yükü ve kalite riski artabilir."
-            return "Line width/nozzle oranı makul; debi yüksekse hız, layer height veya line width azaltılabilir."
+                return "Çizgi genişliği nozzle çapına göre yüksek; akış yükü ve kalite riski artabilir."
+            return "Çizgi genişliği/nozzle oranı makul; debi yüksekse hız, katman yüksekliği veya çizgi genişliği azaltılabilir."
         return ""
 
     @staticmethod
@@ -840,7 +966,7 @@ class FDMModel:
         if mode == "intro":
             return "Temsil notu: 3D sahne eğitim amaçlı ölçeklendirilmiştir; gerçek fizik motoru kullanılmaz."
         if mode == "overhang":
-            return "Sag = max_sag * risk * sin(pi * span_position)^1.4; risk açıklık, fan, hız ve support ile hesaplanır."
+            return "Sarkma = maksimum sarkma × risk × konum etkisi; risk açıklık, fan, hız ve destek ile hesaplanır."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             return f"İdeal PA: {result['ideal']:.3f}, efektif tolerans: ±{result['effective_tolerance']:.3f}, test hızı etki çarpanı: {result['defect_amplifier']:.2f}x."
@@ -848,28 +974,28 @@ class FDMModel:
             return "Dalga = amplitude × sin(2πx / wavelength) × exp(-decay × x)."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
-            return f"İdeal retraction: {result['ideal']:.1f} mm; güvenli aralık {result['safe_min']:.1f}-{result['safe_max']:.1f} mm."
+            return f"İdeal geri çekme: {result['ideal']:.1f} mm; güvenli aralık {result['safe_min']:.1f}-{result['safe_max']:.1f} mm."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"Flow = Layer Height x Line Width x Print Speed = {result['flow']:.2f} mm3/s; nozzle çapı formüle doğrudan girmez."
+            return f"Hacimsel debi = Katman yüksekliği × Çizgi genişliği × Baskı hızı = {result['flow']:.2f} mm³/s; nozzle çapı formüle doğrudan girmez."
         return ""
 
     @staticmethod
     def calculated_value_text(mode, params):
         if mode == "overhang":
             span_mm = bridge_scene_config(params)["span_mm"]
-            return f"Bridge açıklığı: {span_mm:.0f} mm | Sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
+            return f"Köprü açıklığı: {span_mm:.0f} mm | Sarkma riski: {FDMModel.overhang_risk(params) * 100:.0f}%"
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             return f"PA: {result['pa']:.3f} | Test hızı: {result['speed']:.0f} mm/s | Tolerans: ±{result['effective_tolerance']:.3f} | Etki çarpanı: {result['defect_amplifier']:.2f}x"
         if mode == "input":
-            return f"Ringing riski: {FDMModel.input_shaping_risk(params) * 100:.0f}%"
+            return f"Titreşim izi/ringing riski: {FDMModel.input_shaping_risk(params) * 100:.0f}%"
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
-            return f"Stringing {result['stringing_risk'] * 100:.0f}% | Restart gap {result['restart_gap_risk'] * 100:.0f}%"
+            return f"İpliklenme {result['stringing_risk'] * 100:.0f}% | Yeniden başlama boşluğu {result['restart_gap_risk'] * 100:.0f}%"
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
-            return f"Flow: {result['flow']:.2f} mm3/s | Limit: {float(params.get('max_flow', 12)):.1f} | Nozzle çapı: {result['nozzle_diameter']:.1f} mm | Line width/nozzle oranı: {result['line_to_nozzle_ratio']:.2f}x"
+            return f"Hacimsel debi: {result['flow']:.2f} mm³/s | Limit: {float(params.get('max_flow', 12)):.1f} mm³/s | Nozzle çapı: {result['nozzle_diameter']:.1f} mm | Çizgi genişliği/nozzle oranı: {result['line_to_nozzle_ratio']:.2f}x"
         return "3D öğretici görünüm hazır"
 
     @staticmethod
@@ -883,13 +1009,13 @@ class FDMModel:
         result = FDMModel.volumetric_flow_risk(params)
         line_ratio = result["line_to_nozzle_ratio"]
         if line_ratio < FLOW_REASONABLE_LINE_RATIO_MIN:
-            warning = "Line width nozzle'a göre düşük."
+            warning = "Çizgi genişliği nozzle'a göre düşük."
         elif line_ratio > FLOW_REASONABLE_LINE_RATIO_MAX:
-            warning = "Line width nozzle'a göre yüksek; kalite/akış riski artabilir."
+            warning = "Çizgi genişliği nozzle'a göre yüksek; kalite/akış riski artabilir."
         else:
-            warning = "Line width seçilen nozzle için makul aralıkta."
+            warning = "Çizgi genişliği seçilen nozzle için makul aralıkta."
         return (
-            "Nozzle çapı debi formülüne doğrudan girmez; line width/nozzle oranı, "
+            "Nozzle çapı debi formülüne doğrudan girmez; çizgi genişliği/nozzle oranı, "
             f"görsel ölçek ve kalite yorumu için kullanılır. Uyarı: {warning}"
         )
 
@@ -900,36 +1026,36 @@ class FDMModel:
         if mode == "overhang":
             risk = FDMModel.overhang_risk(params)
             if risk < 0.20:
-                return "Bridge temiz kaldı."
+                return "Köprüleme temiz kaldı."
             if risk < 0.60:
-                return "Bridge ortasında hafif sarkma oluştu."
-            return "Bridge ortasında belirgin sarkma oluştu."
+                return "Köprü ortasında hafif sarkma oluştu."
+            return "Köprü ortasında belirgin sarkma oluştu."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
                 return "Köşelerde fazla filament birikimi oluştu."
             if result["high_pa_defect"] > 0.33:
-                return "Köşe yakınında incelme/gap oluştu."
+                return "Köşe yakınında incelme veya küçük boşluk oluştu."
             return "Köşe davranışı dengeli görünüyor."
         if mode == "input":
             risk = FDMModel.input_shaping_risk(params)
             if risk > 0.35:
-                return "Duvar kenarında ringing izi oluştu."
-            return "Ringing izi düşük seviyede kaldı."
+                return "Duvar kenarında titreşim izi/ringing oluştu."
+            return "Titreşim izi/ringing düşük seviyede kaldı."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
             if result["restart_gap_risk"] > 0.35:
-                return "Başlangıç noktasında restart gap oluştu."
+                return "Başlangıç noktasında yeniden başlama boşluğu (restart gap) oluştu."
             if result["stringing_risk"] > 0.35:
-                return "Travel sırasında ipliklenme oluştu."
-            return "Travel ve yeniden başlama davranışı dengeli görünüyor."
+                return "Boşta hareket sırasında ipliklenme oluştu."
+            return "Boşta hareket ve yeniden başlama davranışı dengeli görünüyor."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] > 1.0:
-                return "Extrusion çizgilerinde incelme ve kısa boşluklar oluştu."
+                return "Ekstrüzyon hatlarında incelme ve kısa boşluklar oluştu."
             if result["ratio"] > 0.75:
-                return "Extrusion çizgisi limite yaklaşırken hafif inceldi."
-            return "Extrusion çizgileri dolu ve sürekli kaldı."
+                return "Ekstrüzyon hattı limite yaklaşırken hafif inceldi."
+            return "Ekstrüzyon hatları dolu ve sürekli kaldı."
         return ""
 
     @staticmethod
@@ -937,7 +1063,7 @@ class FDMModel:
         if mode == "intro":
             return "Sahneler parametre etkilerini temsili olarak karşılaştırmak için hazırlanmıştır."
         if mode == "overhang":
-            return "Bridge açıklığı, fan, hız ve support durumuna göre soğuma/sarkma riski değişti."
+            return "Köprü açıklığı, fan, hız ve destek durumuna göre soğuma/sarkma riski değişti."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
@@ -951,7 +1077,7 @@ class FDMModel:
                 return "Shaper ve hız/ivme ayarları titreşimi düşük tuttu."
             return "Yüksek hız/ivme mekanik titreşimi görünür hale getiriyor."
         if mode == "retraction":
-            return "Retraction, sıcaklık ve travel hızı sızıntı ya da restart riskini belirliyor."
+            return "Geri çekme, sıcaklık ve boşta hareket hızı sızıntı ya da yeniden başlama riskini belirliyor."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] <= 0.75:
@@ -966,7 +1092,7 @@ class FDMModel:
         if mode == "intro":
             return "Soldan bir mod seçip parametreleri değiştir."
         if mode == "overhang":
-            return "Fanı artır, hızı azalt veya support kullan."
+            return "Fanı artır, hızı azalt veya destek kullan."
         if mode == "pressure":
             result = FDMModel.pressure_advance_quality(params)
             if result["low_pa_defect"] > 0.33:
@@ -978,19 +1104,19 @@ class FDMModel:
             risk = FDMModel.input_shaping_risk(params)
             if risk <= 0.35:
                 return "Ayarları koru; daha yüksek hızlarda shaper tiplerini karşılaştır."
-            return "Acceleration azalt veya shaper tipini karşılaştır."
+            return "İvmeyi azalt veya shaper tipini karşılaştır."
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
             if result["restart_gap_risk"] > 0.35:
-                return "Retraction mesafesini azalt."
+                return "Geri çekme mesafesini azalt."
             if result["stringing_risk"] > 0.35:
-                return "Retraction mesafesini artır, sıcaklığı düşür veya travel hızını artır."
+                return "Geri çekme mesafesini artır, sıcaklığı düşür veya boşta hareket hızını artır."
             return "Ayarları koru; malzemeye göre küçük testlerle doğrula."
         if mode == "flow":
             result = FDMModel.volumetric_flow_risk(params)
             if result["ratio"] <= 0.75:
-                return "Ayarlar güvenli görünüyor; line width/nozzle oranını da kontrol et."
-            return "Hızı, layer height'ı veya line width'i azalt."
+                return "Ayarlar güvenli görünüyor; çizgi genişliği/nozzle oranını da kontrol et."
+            return "Baskı hızını, katman yüksekliğini veya çizgi genişliğini azalt."
         return ""
 
     @staticmethod
@@ -999,34 +1125,35 @@ class FDMModel:
             result = FDMModel.pressure_advance_quality(params)
             return [("Köşe kalite skoru", result["quality"], False)]
         if mode == "overhang":
-            return [("Bridge sarkma riski", FDMModel.overhang_risk(params), True)]
+            return [("Köprü sarkma riski", FDMModel.overhang_risk(params), True)]
         if mode == "input":
-            return [("Ringing riski", FDMModel.input_shaping_risk(params), True)]
+            return [("Titreşim izi/ringing riski", FDMModel.input_shaping_risk(params), True)]
         if mode == "retraction":
             result = FDMModel.retraction_stringing_risk(params)
             return [
-                ("Stringing riski", result["stringing_risk"], True),
-                ("Restart gap riski", result["restart_gap_risk"], True),
+                ("İpliklenme riski", result["stringing_risk"], True),
+                ("Yeniden başlama boşluğu riski", result["restart_gap_risk"], True),
                 ("Genel risk", result["combined_risk"], True),
             ]
         if mode == "flow":
             return [("Hotend limit riski", FDMModel.volumetric_flow_risk(params)["risk"], True)]
-        return [("Rehber tamamlık", 0.88, False)]
+        return []
 
     @staticmethod
-    def report_copy_text(mode, params):
-        score_label, _, score, _ = FDMModel.score_for_mode(mode, params)
+    def report_copy_text(mode, params, term_mode=DEFAULT_TERM_MODE):
+        score_label, _, score, is_risk = FDMModel.score_for_mode(mode, params)
         lines = [
             "FDM Parametreleri Görselleştiricisi",
-            f"Mod: {MODE_LABELS.get(mode, mode)}",
-            f"{score_label}: {score}/100",
-            f"Hesaplanan değer: {FDMModel.calculated_value_text(mode, params)}",
-            "",
-            "Parametreler:",
+            f"Mod: {mode_label(mode, term_mode)}",
         ]
+        if mode == "intro":
+            lines.append("Durum: Simülasyon hazır")
+        else:
+            lines.append(FDMModel.score_display_text(mode, score_label, score, is_risk))
+            lines.append(f"Hesaplanan değer: {FDMModel.calculated_value_text(mode, params)}")
+        lines.extend(["", "Parametreler:"])
         if params:
-            for key, value in params.items():
-                lines.append(f"- {key}: {value}")
+            lines.extend(FDMModel.formatted_parameter_lines(mode, params))
         else:
             lines.append("- Ana sayfa: parametre yok")
         lines.extend(
@@ -1049,6 +1176,7 @@ class SimulationState:
         self.running = True
         self.animation_time = 0.0
         self.animation_speed = 1.0
+        self.term_mode = DEFAULT_TERM_MODE
         self.selected_preset = "PLA"
         self.parameters = deepcopy(DEFAULT_PARAMETERS)
         self.apply_preset("PLA")
@@ -1103,7 +1231,7 @@ class GLSceneWidget(QWidget):
             return
 
         self.view = gl.GLViewWidget()
-        self.view.setBackgroundColor("#0b1118")
+        self.view.setBackgroundColor("#091018")
         layout.addWidget(self.view)
         self.scene_badge = QLabel("Eğitimsel 3D görsel", self)
         self.scene_badge.setObjectName("SceneBadge")
@@ -1153,7 +1281,7 @@ class GLSceneWidget(QWidget):
     def add_grid(self):
         if self.view is None:
             return
-        grid = gl.GLGridItem(color=(92, 108, 120, 46))
+        grid = gl.GLGridItem(color=(90, 106, 118, 28))
         grid.setSize(x=BED_SIZE_X, y=BED_SIZE_Y, z=1)
         grid.setSpacing(x=10, y=10, z=1)
         self.add_item(grid)
@@ -1175,7 +1303,7 @@ class GLSceneWidget(QWidget):
     def scene_height(self, height):
         return max(0.22, float(height) * Z_VISUAL_SCALE * LAYER_HEIGHT_VISUAL)
 
-    def mesh_item(self, vertexes, faces, color="#ff8a3d", alpha=1.0, edge="#101820", gl_options=None, draw_edges=True, face_colors=None):
+    def mesh_item(self, vertexes, faces, color="#ff8a3d", alpha=1.0, edge="#101820", gl_options=None, draw_edges=True, face_colors=None, smooth=False, compute_normals=False):
         if gl is None:
             return None
         if face_colors is None:
@@ -1186,10 +1314,10 @@ class GLSceneWidget(QWidget):
             vertexes=np.asarray(vertexes, dtype=np.float32),
             faces=np.asarray(faces, dtype=np.uint32),
             faceColors=face_colors,
-            smooth=False,
+            smooth=smooth,
             drawEdges=draw_edges,
             edgeColor=color_tuple(edge, min(0.72, 0.12 + alpha * 0.55)),
-            computeNormals=False,
+            computeNormals=compute_normals,
             glOptions=gl_options or ("translucent" if alpha < 1 else "opaque"),
         )
 
@@ -1622,6 +1750,8 @@ class GLSceneWidget(QWidget):
         distances = self.path_distances(points)
         total = max(distances[-1], 0.001)
         closed = float(np.linalg.norm(points[0] - points[-1])) < 0.04
+        section_count = BEAD_CROSS_SECTION_SEGMENTS
+        section_angles = [-math.pi / 2 + 2 * math.pi * side / section_count for side in range(section_count)]
         vertices = []
         for index, point in enumerate(points):
             if index == 0:
@@ -1640,23 +1770,24 @@ class GLSceneWidget(QWidget):
             local_width = width * clamp(float(modifiers[index]), 0.30, 1.85)
             half = local_width * 0.5
             z = np.asarray((0.0, 0.0, 1.0), dtype=float)
-            vertices.extend(
-                [
-                    point - perp * half - z * height * 0.40,
-                    point + perp * half - z * height * 0.40,
-                    point + perp * half * 0.96 + z * height * 0.02,
-                    point + perp * half * 0.34 + z * height * 0.46,
-                    point - perp * half * 0.34 + z * height * 0.46,
-                    point - perp * half * 0.96 + z * height * 0.02,
-                ]
-            )
+            for angle in section_angles:
+                lateral = perp * (half * math.cos(angle))
+                vertical = z * (height * (0.04 + 0.44 * math.sin(angle)))
+                vertices.append(point + lateral + vertical)
 
         faces = []
         face_colors = []
-        side_dark = self.shaded_color(color, alpha, 78)
-        side_mid = self.shaded_color(color, alpha, 94)
-        top_light = self.shaded_color(color, alpha, 116)
-        palette = [side_dark, side_mid, side_mid, top_light, side_mid, side_mid]
+        side_dark = self.shaded_color(color, alpha, 82)
+        side_mid = self.shaded_color(color, alpha, 96)
+        top_light = self.shaded_color(color, alpha, 114)
+        palette = []
+        for angle in section_angles:
+            if math.sin(angle) > 0.45:
+                palette.append(top_light)
+            elif math.sin(angle) < -0.55:
+                palette.append(side_dark)
+            else:
+                palette.append(side_mid)
 
         def add_tri(face, rgba):
             faces.append(face)
@@ -1667,9 +1798,9 @@ class GLSceneWidget(QWidget):
             add_tri((b, c, d), rgba)
 
         def add_cap(section, reverse=False):
-            base = section * 6
+            base = section * section_count
             rgba = side_dark
-            for offset in range(1, 5):
+            for offset in range(1, section_count - 1):
                 if reverse:
                     add_tri((base, base + offset + 1, base + offset), rgba)
                 else:
@@ -1689,10 +1820,10 @@ class GLSceneWidget(QWidget):
             if not previous_visible:
                 add_cap(index, reverse=True)
 
-            first = index * 6
-            second = (index + 1) * 6
-            for side in range(6):
-                next_side = (side + 1) % 6
+            first = index * section_count
+            second = (index + 1) * section_count
+            for side in range(section_count):
+                next_side = (side + 1) % section_count
                 add_quad(first + side, first + next_side, second + next_side, second + side, palette[side])
 
             if not next_visible:
@@ -1700,9 +1831,9 @@ class GLSceneWidget(QWidget):
 
         if not faces:
             return None
-        return self.add_item(self.mesh_item(vertices, faces, color, alpha, draw_edges=False, face_colors=face_colors))
+        return self.add_item(self.mesh_item(vertices, faces, color, alpha, draw_edges=False, face_colors=face_colors, smooth=True, compute_normals=True))
 
-    def add_box(self, center, size, color="#ff8a3d", alpha=1.0, edge="#101820"):
+    def add_box(self, center, size, color="#ff8a3d", alpha=1.0, edge="#101820", draw_edges=True):
         cx, cy, cz = center
         sx, sy, sz = size
         x0, x1 = cx - sx / 2, cx + sx / 2
@@ -1710,9 +1841,9 @@ class GLSceneWidget(QWidget):
         z0, z1 = cz - sz / 2, cz + sz / 2
         vertexes = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
         faces = [(0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6), (0, 4, 5), (0, 5, 1), (1, 5, 6), (1, 6, 2), (2, 6, 7), (2, 7, 3), (3, 7, 4), (3, 4, 0)]
-        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge))
+        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge, draw_edges=draw_edges))
 
-    def add_cylinder(self, center, radius, height, color="#ff8a3d", alpha=1.0, segments=24):
+    def add_cylinder(self, center, radius, height, color="#ff8a3d", alpha=1.0, segments=ROUND_GEOMETRY_SEGMENTS):
         cx, cy, cz = center
         z0, z1 = cz - height / 2, cz + height / 2
         vertexes = [(cx, cy, z0), (cx, cy, z1)]
@@ -1726,9 +1857,9 @@ class GLSceneWidget(QWidget):
             b0, t0 = 2 + i * 2, 3 + i * 2
             b1, t1 = 2 + j * 2, 3 + j * 2
             faces.extend([(b0, b1, t1), (b0, t1, t0), (0, b0, b1), (1, t1, t0)])
-        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge="#0f1419"))
+        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge="#0f1419", draw_edges=False, smooth=True, compute_normals=True))
 
-    def add_cone(self, tip, radius, height, color="#cbd5df", alpha=1.0, segments=24):
+    def add_cone(self, tip, radius, height, color="#cbd5df", alpha=1.0, segments=ROUND_GEOMETRY_SEGMENTS):
         tx, ty, tz = tip
         base_z = tz + height
         vertexes = [(tx, ty, tz), (tx, ty, base_z)]
@@ -1741,7 +1872,7 @@ class GLSceneWidget(QWidget):
             k = 2 + i
             faces.append((0, k, j))
             faces.append((1, j, k))
-        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge="#687482"))
+        return self.add_item(self.mesh_item(vertexes, faces, color, alpha, edge="#687482", draw_edges=False, smooth=True, compute_normals=True))
 
     def add_sphere_marker(self, position, size, color="#ff4d5d", alpha=0.9):
         if gl is None:
@@ -1806,7 +1937,7 @@ class GLSceneWidget(QWidget):
         has_flow_marks = any(segment.segment_type == "underextrusion" or float(segment.meta.get("flow_ratio", 0.0)) > 0.75 for segment in run)
         has_pressure_marks = any(segment.meta.get("profile") == "pressure" for segment in run)
         has_restart_marks = any(float(segment.meta.get("restart_gap_risk", 0.0)) > 0.0 or float(segment.meta.get("restart_blob_risk", 0.0)) > 0.0 for segment in run)
-        max_step = 0.10 if (has_flow_marks or has_pressure_marks or has_restart_marks) else 0.16
+        max_step = 0.10 if (has_flow_marks or has_pressure_marks or has_restart_marks) else 0.12
         model_points, samples, total = self.generate_bead_samples_along_path(run, max_step=max_step)
         if len(model_points) < 2:
             return
@@ -1889,19 +2020,66 @@ class GLSceneWidget(QWidget):
             return
         self.add_segment_strip(segment, progress=progress, alpha=0.82)
 
-    def add_nozzle(self, tip):
-        tip = self.scene_point(tip) + np.array((0.0, 0.0, self.scene_height(self.engine.visual_segment_height()) * 0.72))
-        ns = NOZZLE_SCALE
+    def toolhead_scale(self):
+        ns = NOZZLE_SCALE * 1.26
         if self.state.active_mode == "flow":
             flow_result = FDMModel.volumetric_flow_risk(self.state.current_params())
             nozzle_diameter = float(flow_result["nozzle_diameter"])
             ns *= lerp(0.88, 1.28, clamp((nozzle_diameter - 0.4) / 0.4, 0.0, 1.0))
-        self.add_cone(tip, radius=2.35 * ns, height=6.20 * ns, color="#dbe2ea", alpha=1.0)
-        self.add_cylinder(center=(tip[0], tip[1], tip[2] + 0.42 * ns), radius=0.48 * ns, height=0.90 * ns, color="#29323a", alpha=1.0, segments=16)
-        self.add_box(center=(tip[0], tip[1], tip[2] + 7.60 * ns), size=(6.40 * ns, 5.20 * ns, 3.20 * ns), color="#7f8c98", alpha=1.0, edge="#d7e0e8")
-        self.add_box(center=(tip[0], tip[1], tip[2] + 5.45 * ns), size=(7.60 * ns, 1.40 * ns, 1.35 * ns), color="#ff8a3d", alpha=1.0, edge="#ffd0aa")
-        self.add_line([(tip[0], tip[1], tip[2] + 9.00 * ns), (tip[0] - 4.8 * ns, tip[1] - 2.3 * ns, tip[2] + 15.5 * ns)], "#8190a0", 2.0, 0.75)
-        self.add_line([(tip[0], tip[1], tip[2] + 9.00 * ns), (tip[0] + 4.8 * ns, tip[1] + 2.3 * ns, tip[2] + 15.5 * ns)], "#8190a0", 2.0, 0.75)
+        return ns
+
+    def add_nozzle(self, tip):
+        tip = self.scene_point(tip) + np.array((0.0, 0.0, self.scene_height(self.engine.visual_segment_height()) * 0.72))
+        ns = self.toolhead_scale()
+        x, y, z = tip
+
+        # Low-poly toolhead: a few readable parts instead of a CAD-heavy model.
+        self.add_box(center=(x, y, z + 13.4 * ns), size=(9.2 * ns, 6.3 * ns, 3.6 * ns), color="#46525d", alpha=1.0, edge="#8fa0ad", draw_edges=False)
+        self.add_box(center=(x, y, z + 10.7 * ns), size=(6.9 * ns, 4.9 * ns, 1.0 * ns), color="#6d7a84", alpha=1.0, edge="#b7c3cc", draw_edges=False)
+        for fin_index in range(4):
+            fin_z = z + (8.0 + fin_index * 0.78) * ns
+            self.add_box(center=(x, y, fin_z), size=(6.2 * ns, 4.6 * ns, 0.28 * ns), color="#a6b0b8", alpha=1.0, edge="#d4dce2", draw_edges=False)
+        self.add_box(center=(x, y, z + 5.85 * ns), size=(7.4 * ns, 3.7 * ns, 2.25 * ns), color="#c0a06f", alpha=1.0, edge="#ffe0a8", draw_edges=False)
+        self.add_box(center=(x + 5.0 * ns, y - 0.15 * ns, z + 8.6 * ns), size=(2.3 * ns, 4.0 * ns, 3.0 * ns), color="#26313b", alpha=1.0, edge="#61717f", draw_edges=False)
+        self.add_box(center=(x + 6.35 * ns, y - 0.15 * ns, z + 6.25 * ns), size=(2.2 * ns, 2.0 * ns, 1.05 * ns), color="#26313b", alpha=1.0, edge="#5b6b78", draw_edges=False)
+        self.add_cone(tip, radius=2.25 * ns, height=5.15 * ns, color="#d7b56f", alpha=1.0)
+        self.add_cylinder(center=(x, y, z + 0.34 * ns), radius=0.50 * ns, height=0.72 * ns, color="#ff8a3d", alpha=0.95)
+        self.add_line([(x, y, z + 15.2 * ns), (x, y, z + 21.0 * ns)], "#c9d4dc", 3.2, 0.78)
+        self.add_line([(x + 2.9 * ns, y + 1.4 * ns, z + 14.5 * ns), (x + 6.5 * ns, y + 2.0 * ns, z + 18.8 * ns)], "#657482", 2.3, 0.58)
+
+    def add_cooling_airflow(self):
+        if self.state.active_mode != "overhang":
+            return
+        params = self.state.current_params()
+        fan = clamp(float(params.get("fan", 0)) / 100.0, 0.0, 1.0)
+        if fan <= 0.01:
+            return
+
+        ns = self.toolhead_scale()
+        nozzle_tip = self.scene_point(self.engine.nozzle_position) + np.array((0.0, 0.0, self.scene_height(self.engine.visual_segment_height()) * 0.72))
+        origin_base = nozzle_tip + np.array((7.1 * ns, -1.6 * ns, 6.2 * ns))
+        airflow_direction = np.array((-0.46, -0.06, -0.89), dtype=float)
+        airflow_direction /= float(np.linalg.norm(airflow_direction))
+        side_axis = np.array((0.02, 1.0, -0.08), dtype=float)
+        side_axis /= float(np.linalg.norm(side_axis))
+        lift_axis = np.array((0.22, 0.02, 0.97), dtype=float)
+        line_count = max(1, 1 + int(round(fan * 5)))
+        alpha = lerp(0.12, 0.34, fan)
+        width = lerp(0.55, 1.15, fan)
+        length = lerp(3.2, 6.9, fan) * ns
+        drift_span = lerp(0.6, 1.6, fan) * ns
+
+        for index in range(line_count):
+            centered = index - (line_count - 1) / 2
+            lane_spacing = lerp(0.34, 0.72, fan) * ns
+            phase = self.state.animation_time * 0.95 + index * 0.31
+            drift = (phase % 1.0) * drift_span
+            lane_offset = side_axis * centered * lane_spacing
+            flutter = lift_axis * math.sin(phase * math.tau) * 0.10 * ns * fan
+            start = origin_base + lane_offset + flutter + airflow_direction * drift
+            end = start + airflow_direction * length
+            mid = start + airflow_direction * (length * 0.52) + side_axis * math.sin(phase * math.tau + 0.6) * 0.16 * ns * fan
+            self.add_line([start, mid, end], "#7dd3fc", width, alpha)
 
     def add_overhang_supports(self):
         if self.state.active_mode != "overhang":
@@ -1955,6 +2133,7 @@ class GLSceneWidget(QWidget):
         self.draw_completed_segments()
         self.draw_active_segment_progress()
         self.update_nozzle_pose()
+        self.add_cooling_airflow()
 
     def animate(self):
         self.update_scene()
@@ -1981,36 +2160,36 @@ class ParameterPanel(QWidget):
 
     def rebuild(self):
         self.clear_layout()
-        title = QLabel(MODE_LABELS[self.state.active_mode])
+        title = QLabel(mode_label(self.state.active_mode, self.state.term_mode))
         title.setObjectName("ModeTitle")
         title.setWordWrap(True)
         self.layout.addWidget(title)
         if self.state.active_mode == "intro":
             self.build_intro_panel()
         elif self.state.active_mode == "overhang":
-            self.add_help("İki pylon arasındaki bridge çizgilerinde fan, hız ve support sarkmayı etkiler.")
+            self.add_help("İki destek arasındaki köprü çizgilerinde fan, hız ve açıklığın sarkmayı nasıl etkilediğini gösterir.")
             self.add_section_title("Parametreler")
             self.build_overhang_controls()
         elif self.state.active_mode == "pressure":
-            self.add_help("Pressure Advance köşe basıncı, blob ve gap davranışını temsili olarak gösterir.")
+            self.add_help("Basınç dengeleme (Pressure Advance), köşe ve hız değişimlerinde filament basıncını dengelemeyi temsil eder.")
             self.add_section_title("Parametreler")
             self.build_pressure_controls()
         elif self.state.active_mode == "input":
-            self.add_help("Shaper tipi ve hız/ivme değerleri yüzeydeki ringing izlerini değiştirir.")
+            self.add_help("Shaper tipi, hız ve ivme değerlerinin yüzeydeki titreşim izi/ringing etkisini gösterir.")
             self.add_section_title("Parametreler")
             self.build_input_controls()
         elif self.state.active_mode == "retraction":
-            self.add_help("Retraction travel sırasındaki sızıntıyı ve fazla retraction gap riskini etkiler.")
+            self.add_help("Boşta hareket sırasında oluşan ipliklenme ve fazla geri çekme kaynaklı yeniden başlama boşluğu (restart gap) riskini gösterir.")
             self.add_section_title("Parametreler")
             self.build_retraction_controls()
         elif self.state.active_mode == "flow":
-            self.add_help("Layer height × line width × speed hotend'in eritmesi gereken debiyi verir.")
+            self.add_help("Katman yüksekliği, çizgi genişliği ve baskı hızından hotend'in taşıması gereken hacimsel debiyi hesaplar.")
             self.add_section_title("Parametreler")
             self.build_flow_controls()
         self.layout.addStretch(1)
 
     def build_intro_panel(self):
-        self.add_help("Soldan bir mod seç; 3D sahnede parametrelerin temsili etkisini izle.")
+        self.add_help("Soldan bir mod seç; ayarların 3D sahnede nasıl temsil edildiğini izle.")
 
     def add_help(self, text):
         body = QLabel(text)
@@ -2120,34 +2299,34 @@ class ParameterPanel(QWidget):
         self.layout.addWidget(frame)
 
     def build_overhang_controls(self):
-        self.add_slider("Bridge açıklığı", "angle", 10, 80, 1, "mm", "İki pylon arasındaki köprü mesafesini temsil eder.")
-        self.add_slider("Fan hızı", "fan", 0, 100, 1, "%", "Bridge filamentinin ne kadar hızlı soğuduğunu temsil eder.")
-        self.add_slider("Baskı hızı", "speed", 20, 120, 1, "mm/s", "Bridge sırasında yüksek hız sarkmayı artırabilir.")
-        self.add_checkbox("Support kullan", "support", "Boşluğun altında sade destek kolonları gösterir ve sag riskini düşürür.")
+        self.add_slider("Köprü açıklığı", "angle", 10, 80, 1, "mm", "İki destek kulesi arasındaki köprü mesafesini temsil eder.")
+        self.add_slider("Fan hızı", "fan", 0, 100, 1, "%", "Köprü filamentinin ne kadar hızlı soğuduğunu temsil eder.")
+        self.add_slider("Baskı hızı", "speed", 20, 120, 1, "mm/s", "Köprüleme sırasında yüksek hız sarkmayı artırabilir.")
+        self.add_checkbox("Destek kullan", "support", "Boşluğun altında sade destek kolonları gösterir ve sarkma riskini düşürür.")
 
     def build_pressure_controls(self):
         self.add_slider("Pressure Advance", "pa", PA_SLIDER_MIN, PA_SLIDER_MAX, PA_SLIDER_STEP, "", "Köşe basıncını 0.005 adımlarla dengelemeyi temsil eder.")
-        self.add_combo("Extruder tipi", "extruder", ["Direct Drive", "Bowden"], "Direct drive ve Bowden için ideal PA farklıdır.")
+        self.add_combo("Ekstruder tipi", "extruder", ["Direct Drive", "Bowden"], "Direct drive ve Bowden için ideal PA farklıdır.")
         self.add_slider("Test hızı", "speed", 30, 180, 1, "mm/s", "Bu hız, PA testinde köşe davranışını zorlaştıran temsili test hızıdır. Yüksek test hızı, düşük/yüksek PA hatalarını daha görünür yapar.")
 
     def build_input_controls(self):
-        self.add_slider("Acceleration", "acceleration", 500, 10000, 100, "mm/s²", "Yüksek ivme ringing riskini artırabilir.")
+        self.add_slider("İvme", "acceleration", 500, 10000, 100, "mm/s²", "Yüksek ivme titreşim izi/ringing riskini artırabilir.")
         self.add_slider("Rezonans frekansı", "frequency", 20, 80, 1, "Hz", "Titreşime yatkın frekansı temsil eder.")
         self.add_combo("Shaper tipi", "shaper", ["Kapalı", "MZV", "EI", "2HUMP_EI"], "Input shaping titreşim izlerini azaltır.")
         self.add_slider("Baskı hızı", "speed", 40, 250, 1, "mm/s", "Yüksek hız titreşim etkisini görünür yapabilir.")
 
     def build_retraction_controls(self):
-        self.add_slider("Retraction mesafesi", "retraction", 0.0, 8.0, 0.1, "mm", "Travel sırasında filamentin geri çekilmesini temsil eder.")
-        self.add_slider("Nozzle sıcaklığı", "temperature", 180, 260, 1, "°C", "Sıcaklık arttıkça stringing riski artabilir.")
-        self.add_slider("Travel hızı", "travel_speed", 50, 250, 1, "mm/s", "Hızlı travel sızıntı süresini azaltır.")
-        self.add_combo("Extruder tipi", "extruder", ["Direct Drive", "Bowden"], "İdeal retraction mesafesi extruder tipine göre değişir.")
+        self.add_slider("Geri çekme mesafesi", "retraction", 0.0, 8.0, 0.1, "mm", "Boşta hareket sırasında filamentin geri çekilmesini temsil eder.")
+        self.add_slider("Nozzle sıcaklığı", "temperature", 180, 260, 1, "°C", "Sıcaklık arttıkça ipliklenme riski artabilir.")
+        self.add_slider("Boşta hareket hızı (Travel)", "travel_speed", 50, 250, 1, "mm/s", "Hızlı boşta hareket sızıntı süresini azaltır.")
+        self.add_combo("Ekstruder tipi", "extruder", ["Direct Drive", "Bowden"], "İdeal geri çekme mesafesi ekstruder tipine göre değişir.")
 
     def build_flow_controls(self):
-        self.add_slider("Layer Height", "layer_height", 0.08, 0.40, 0.01, "mm", "Katman yüksekliği debiyi etkiler.")
-        self.add_slider("Line Width", "line_width", 0.35, 0.80, 0.01, "mm", "Çizgi genişliği debiyi etkiler.")
-        self.add_slider("Print Speed", "print_speed", 20, 250, 1, "mm/s", "Baskı hızı debiyi doğrudan artırır.")
+        self.add_slider("Katman yüksekliği", "layer_height", 0.08, 0.40, 0.01, "mm", "Katman yüksekliği debiyi etkiler.")
+        self.add_slider("Çizgi genişliği", "line_width", 0.35, 0.80, 0.01, "mm", "Çizgi genişliği debiyi etkiler.")
+        self.add_slider("Baskı hızı", "print_speed", 20, 250, 1, "mm/s", "Baskı hızı debiyi doğrudan artırır.")
         self.add_slider("Hotend kapasitesi", "max_flow", 4, 35, 1, "mm³/s", "Hotend'in eritebildiği yaklaşık hacimdir.")
-        self.add_combo("Nozzle çapı", "nozzle_diameter", ["0.4", "0.6", "0.8"], "Nozzle çapı tek başına debiyi değiştirmez. Debiyi layer height, line width ve print speed belirler; nozzle çapı line width'in mantıklı aralıkta olup olmadığını yorumlamak için kullanılır.", "mm")
+        self.add_combo("Nozzle çapı", "nozzle_diameter", ["0.4", "0.6", "0.8"], "Nozzle çapı tek başına debiyi değiştirmez. Debiyi katman yüksekliği, çizgi genişliği ve baskı hızı belirler; nozzle çapı çizgi genişliğinin mantıklı aralıkta olup olmadığını yorumlamak için kullanılır.", "mm")
 
 
 class InfoPanel(QWidget):
@@ -2192,24 +2371,130 @@ class InfoPanel(QWidget):
 
     def compact_technical_note(self, mode, params):
         if mode == "intro":
-            return FDMModel.visual_note_text(mode)
+            return "Görseller eğitim amaçlı temsilidir; gerçek fizik motoru kullanılmaz."
+        if mode == "overhang":
+            return "Sarkma görseli açıklık, fan, hız ve destek etkisine göre temsil edilir."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            return f"İdeal PA: {result['ideal']:.3f}. Test hızı hataları daha görünür yapar."
+        if mode == "input":
+            return "Titreşim izi/ringing dalgası temsili olarak ölçeklendirilir."
+        if mode == "retraction":
+            result = FDMModel.retraction_stringing_risk(params)
+            return f"Güvenli geri çekme aralığı yaklaşık {result['safe_min']:.1f}-{result['safe_max']:.1f} mm."
         if mode == "flow":
-            return "Flow = Layer Height x Line Width x Print Speed. Nozzle çapı debi formülüne doğrudan girmez; line width/nozzle oranı kalite yorumu içindir."
-        return f"{FDMModel.formula_text(mode, params)} Görsel etki temsili ölçeklendirilmiştir."
+            return "Hacimsel debi = Katman yüksekliği × Çizgi genişliği × Baskı hızı. Nozzle çapı formüle doğrudan girmez."
+        return "Görsel etki eğitim amacıyla ölçeklendirilmiştir."
+
+    def observed_text(self, mode, params):
+        if mode == "intro":
+            return "Bir mod seçildiğinde 3D sahnede temsili etki gösterilir."
+        if mode == "overhang":
+            risk = FDMModel.overhang_risk(params)
+            if risk < 0.20:
+                return "Köprü çizgileri stabil görünüyor."
+            if risk < 0.60:
+                return "Köprünün orta kısmında hafif sarkma görülüyor."
+            return "Köprünün orta kısmında belirgin sarkma görülüyor."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "Köşelerde fazla filament birikimi görünüyor."
+            if result["high_pa_defect"] > 0.33:
+                return "Köşe yakınında incelme veya küçük boşluk görünüyor."
+            return "Köşe davranışı dengeli görünüyor."
+        if mode == "input":
+            if FDMModel.input_shaping_risk(params) > 0.35:
+                return "Duvar kenarında titreşim izi/ringing belirginleşiyor."
+            return "Titreşim izi/ringing düşük seviyede kalıyor."
+        if mode == "retraction":
+            result = FDMModel.retraction_stringing_risk(params)
+            if result["restart_gap_risk"] > 0.35:
+                return "Başlangıç noktasında yeniden başlama boşluğu (restart gap) riski öne çıkıyor."
+            if result["stringing_risk"] > 0.35:
+                return "Boşta hareket sırasında ipliklenme riski artıyor."
+            return "Boşta hareket ve yeniden başlama dengeli görünüyor."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] > 1.0:
+                return "Çizgilerde incelme ve kısa boşluklar oluşabilir."
+            if result["ratio"] > 0.75:
+                return "Hacimsel debi limite yaklaşırken çizgi hafif inceliyor."
+            return "Ekstrüzyon hatları dolu ve sürekli görünüyor."
+        return ""
+
+    def likely_cause_text(self, mode, params):
+        if mode == "intro":
+            return "Sahne, ayar etkilerini hızlıca karşılaştırmak için sadeleştirilmiştir."
+        if mode == "overhang":
+            return "Açıklık uzun, fan düşük veya hız yüksek olduğunda filament daha kolay sarkar."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "PA değeri idealin altında kaldığında köşe basıncı geç boşalır."
+            if result["high_pa_defect"] > 0.33:
+                return "PA değeri fazla olduğunda köşeye yaklaşırken basınç erken düşer."
+            return "PA değeri ideal aralığa yakın olduğu için basınç dengeli kalır."
+        if mode == "input":
+            if FDMModel.input_shaping_risk(params) > 0.35:
+                return "Yüksek hız veya ivme mekanik titreşimi daha görünür yapar."
+            return "Shaper ve hız/ivme ayarları titreşimi düşük tutuyor."
+        if mode == "retraction":
+            return "Geri çekme mesafesi, sıcaklık ve boşta hareket hızı birlikte sızıntı dengesini belirler."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] > 1.0:
+                return "Gereken debi hotend limitini aşıyor."
+            if result["ratio"] > 0.75:
+                return "Gereken debi hotend limitine yaklaşıyor."
+            return "Gereken debi hotend limitinin altında kalıyor."
+        return ""
+
+    def suggestion_text(self, mode, params):
+        if mode == "intro":
+            return "Bir mod seçip sliderları küçük adımlarla dene."
+        if mode == "overhang":
+            return "Fanı artırmak, hızı düşürmek veya destek kullanmak sonucu iyileştirebilir."
+        if mode == "pressure":
+            result = FDMModel.pressure_advance_quality(params)
+            if result["low_pa_defect"] > 0.33:
+                return "PA değerini küçük adımlarla artırmayı dene."
+            if result["high_pa_defect"] > 0.33:
+                return "PA değerini küçük adımlarla azaltmayı dene."
+            return "Bu PA değerini koruyup farklı test hızlarında doğrula."
+        if mode == "input":
+            if FDMModel.input_shaping_risk(params) > 0.35:
+                return "İvme değerini düşür veya shaper tiplerini karşılaştır."
+            return "Ayarları koru; daha yüksek hızlarda shaper tiplerini karşılaştır."
+        if mode == "retraction":
+            result = FDMModel.retraction_stringing_risk(params)
+            if result["restart_gap_risk"] > 0.35:
+                return "Geri çekme mesafesini biraz azaltmayı dene."
+            if result["stringing_risk"] > 0.35:
+                return "Geri çekmeyi artırmak, sıcaklığı düşürmek veya boşta hareket hızını artırmak yardımcı olabilir."
+            return "Ayarlar dengeli; malzemeye göre küçük testlerle doğrula."
+        if mode == "flow":
+            result = FDMModel.volumetric_flow_risk(params)
+            if result["ratio"] > 0.75:
+                return "Baskı hızını, katman yüksekliğini veya çizgi genişliğini azaltmak debiyi düşürür."
+            return "Ayarlar güvenli görünüyor; çizgi genişliği/nozzle oranını da kontrol et."
+        return ""
 
     def update_info(self):
         mode = self.state.active_mode
         params = self.state.current_params()
         score_label, normalized, score, is_risk = FDMModel.score_for_mode(mode, params)
-        color = risk_color(normalized) if is_risk else quality_color(normalized)
-        self.score_label.setText(f"{score_label}: {score}/100")
+        color = QColor("#3ddc84") if mode == "intro" else risk_color(normalized) if is_risk else quality_color(normalized)
+        self.score_label.setText(FDMModel.score_display_text(mode, score_label, score, is_risk))
         self.score_label.setStyleSheet(f"color: {color.name()};")
-        self.score_bar.setValue(score)
-        self.score_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color.name()}; border-radius: 4px; }}")
+        self.score_bar.setVisible(mode != "intro")
+        if mode != "intro":
+            self.score_bar.setValue(score)
+            self.score_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color.name()}; border-radius: 4px; }}")
         self.calculated.setText(f"Hesaplanan değer: {FDMModel.calculated_value_text(mode, params)}")
-        self.what_label.setText(f"Ne oldu? {FDMModel.what_happened_text(mode, params)}")
-        self.why_label.setText(f"Neden? {FDMModel.why_happened_text(mode, params)}")
-        self.todo_label.setText(f"Ne yapmalı? {FDMModel.what_to_do_text(mode, params)}")
+        self.what_label.setText(f"Gözlenen durum: {self.observed_text(mode, params)}")
+        self.why_label.setText(f"Muhtemel sebep: {self.likely_cause_text(mode, params)}")
+        self.todo_label.setText(f"Öneri: {self.suggestion_text(mode, params)}")
         self.visual_note.setText(f"Teknik not: {self.compact_technical_note(mode, params)}")
 
 
@@ -2276,10 +2561,12 @@ class MainWindow(QMainWindow):
         self.mode_buttons = {}
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
-        for mode, label in MODES:
-            button = QPushButton(label)
+        for mode in MODE_KEYS:
+            button = QPushButton(mode_button_label(mode, self.state.term_mode))
             button.setObjectName("ModeButton")
             button.setCheckable(True)
+            button.setFixedHeight(48)
+            button.setToolTip(mode_label(mode, self.state.term_mode))
             button.clicked.connect(lambda checked=False, selected_mode=mode: self.set_mode(selected_mode))
             self.mode_group.addButton(button)
             self.mode_buttons[mode] = button
@@ -2346,21 +2633,30 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.speed_value)
 
         toolbar.addSpacing(8)
-        toolbar.addWidget(QLabel("Preset"))
+        toolbar.addWidget(QLabel("Ön Ayar"))
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems(["PLA", "PETG", "ABS", "Custom"])
-        self.preset_combo.setCurrentText(self.state.selected_preset)
+        self.preset_combo.addItems([preset_display_name(name) for name in ["PLA", "PETG", "ABS", "Custom"]])
+        self.preset_combo.setCurrentText(preset_display_name(self.state.selected_preset))
         self.preset_combo.currentTextChanged.connect(self.apply_preset)
-        self.preset_combo.setFixedWidth(112)
+        self.preset_combo.setFixedWidth(96)
         toolbar.addWidget(self.preset_combo)
 
+        toolbar.addSpacing(8)
+        toolbar.addWidget(QLabel("Terim Modu"))
+        self.term_mode_combo = QComboBox()
+        self.term_mode_combo.addItems(list(TERM_MODE_LABELS.keys()))
+        self.term_mode_combo.setCurrentText(self.state.term_mode)
+        self.term_mode_combo.currentTextChanged.connect(self.set_term_mode)
+        self.term_mode_combo.setFixedWidth(118)
+        toolbar.addWidget(self.term_mode_combo)
+
         export_button = QPushButton("PNG Kaydet")
-        export_button.setObjectName("ToolbarButton")
+        export_button.setObjectName("SecondaryToolbarButton")
         export_button.setFixedHeight(30)
         export_button.clicked.connect(self.export_png)
         toolbar.addWidget(export_button)
         self.copy_button = QPushButton("Raporu Kopyala")
-        self.copy_button.setObjectName("ToolbarButton")
+        self.copy_button.setObjectName("SecondaryToolbarButton")
         self.copy_button.setFixedHeight(30)
         self.copy_button.clicked.connect(self.copy_report)
         toolbar.addWidget(self.copy_button)
@@ -2398,6 +2694,20 @@ class MainWindow(QMainWindow):
             button.setChecked(key == mode)
         self.refresh_panels(rebuild_parameters=True)
 
+    def refresh_mode_labels(self):
+        for mode, button in self.mode_buttons.items():
+            button.setText(mode_button_label(mode, self.state.term_mode))
+            button.setToolTip(mode_label(mode, self.state.term_mode))
+
+    def set_term_mode(self, term_mode):
+        if term_mode not in TERM_MODE_LABELS or term_mode == self.state.term_mode:
+            return
+        self.state.term_mode = term_mode
+        self.refresh_mode_labels()
+        self.parameter_panel.rebuild()
+        self.info_panel.update_info()
+        self.update_footer()
+
     def start_animation(self):
         self.state.running = True
 
@@ -2420,8 +2730,12 @@ class MainWindow(QMainWindow):
         self.speed_value.setText(f"{self.state.animation_speed:.2f}x")
 
     def apply_preset(self, preset_name):
+        preset_name = preset_internal_name(preset_name)
         self._updating_preset = True
         self.state.apply_preset(preset_name)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText(preset_display_name(preset_name))
+        self.preset_combo.blockSignals(False)
         self.state.reset()
         self.refresh_panels(rebuild_parameters=True)
         self._updating_preset = False
@@ -2430,7 +2744,7 @@ class MainWindow(QMainWindow):
         if not self._updating_preset and self.state.selected_preset != "Custom":
             self.state.selected_preset = "Custom"
             self.preset_combo.blockSignals(True)
-            self.preset_combo.setCurrentText("Custom")
+            self.preset_combo.setCurrentText(preset_display_name("Custom"))
             self.preset_combo.blockSignals(False)
         self.state.reset()
         self.refresh_panels(rebuild_parameters=False)
@@ -2445,14 +2759,14 @@ class MainWindow(QMainWindow):
     def update_footer(self):
         mode_messages = {
             "intro": "Soldan bir mod seç; 3D sahnede temsili etkiyi izle.",
-            "overhang": "Bridge açıklığı, fan, hız ve support sarkma görünümünü etkiler.",
+            "overhang": "Köprü açıklığı, fan, hız ve destek sarkma görünümünü etkiler.",
             "pressure": "Test hızı, PA köşe hatalarının görünürlüğünü artırır.",
-            "input": "Shaper ve ivme ayarı ringing izini değiştirir.",
-            "retraction": "Retraction ayarı stringing ve restart gap dengesini gösterir.",
-            "flow": "Flow hesabı layer height, line width ve print speed ile yapılır.",
+            "input": "Shaper ve ivme ayarı titreşim izi/ringing görünümünü değiştirir.",
+            "retraction": "Geri çekme ayarı ipliklenme ve yeniden başlama boşluğu dengesini gösterir.",
+            "flow": "Hacimsel debi hesabı katman yüksekliği, çizgi genişliği ve baskı hızı ile yapılır.",
         }
         self.footer_explanation.setText(
-            "Gerçek fizik motoru değildir; parametre etkileri eğitim amaçlı temsil edilir. "
+            "Parametre etkileri eğitim amacıyla temsili olarak gösterilir; gerçek fizik motoru kullanılmaz. "
             f"{mode_messages.get(self.state.active_mode, '')}"
         )
 
@@ -2477,7 +2791,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "PNG kaydedilemedi", "Seçilen konuma PNG dosyası kaydedilemedi.")
 
     def copy_report(self):
-        text = FDMModel.report_copy_text(self.state.active_mode, self.state.current_params())
+        text = FDMModel.report_copy_text(self.state.active_mode, self.state.current_params(), self.state.term_mode)
         QApplication.clipboard().setText(text)
         old_text = self.copy_button.text()
         self.copy_button.setText("Kopyalandı")
@@ -2486,21 +2800,21 @@ class MainWindow(QMainWindow):
     def apply_theme(self):
         self.setStyleSheet(
             """
-            QMainWindow { background: #090d13; color: #eaf0f6; }
-            QWidget { color: #eaf0f6; font-family: Segoe UI, Arial; font-size: 10pt; }
-            QMenuBar { background: #0f151d; color: #dce6ee; border-bottom: 1px solid #1d2a36; }
-            QMenuBar::item:selected, QMenu::item:selected { background: #263748; }
-            QMenu { background: #111923; color: #eaf0f6; border: 1px solid #273746; }
+            QMainWindow { background: #0a0f15; color: #edf3f8; }
+            QWidget { color: #edf3f8; font-family: Segoe UI, Arial; font-size: 10pt; }
+            QMenuBar { background: #101720; color: #dce6ee; border-bottom: 1px solid #1c2935; }
+            QMenuBar::item:selected, QMenu::item:selected { background: #243342; }
+            QMenu { background: #111a23; color: #edf3f8; border: 1px solid #273746; }
             #Header, #SidePanel, #RightPanel, #Footer, #InfoPanel, #GLSceneShell {
-                background: #101821; border: 1px solid #1f2c39; border-radius: 8px;
+                background: #111922; border: 1px solid #223140; border-radius: 8px;
             }
-            #Header { background: #111b25; }
+            #Header { background: #121d27; }
             #AppTitle { font-size: 15pt; font-weight: 700; color: #ffffff; }
-            #AppSubtitle { color: #9fb0c0; font-size: 9pt; }
+            #AppSubtitle { color: #a4b4c3; font-size: 9pt; }
             #PanelTitle { font-size: 10.5pt; font-weight: 700; color: #ffffff; }
             #ModeTitle { font-size: 13pt; font-weight: 800; color: #ffffff; }
-            #ModeDescription { color: #aebaca; font-size: 9pt; line-height: 120%; }
-            #SectionLabel { color: #ffbc84; font-size: 8.7pt; font-weight: 800; padding-top: 2px; }
+            #ModeDescription { color: #b3c0cc; font-size: 9.2pt; line-height: 125%; }
+            #SectionLabel { color: #f0a76b; font-size: 8.8pt; font-weight: 800; padding-top: 2px; }
             #ControlTitle { color: #eaf0f6; font-weight: 600; }
             #CardTitle { font-weight: 700; color: #f3f7fb; }
             #MutedText { color: #aebaca; }
@@ -2508,67 +2822,83 @@ class MainWindow(QMainWindow):
             #WarningText { color: #ffcf7a; font-weight: 600; }
             #StatusText { color: #9fb0c0; font-size: 8.7pt; }
             #ResultScore { font-weight: 800; font-size: 11pt; }
-            #ResultLine { color: #cfe0ee; font-size: 8.8pt; }
+            #ResultLine { color: #d5e3ef; font-size: 9pt; line-height: 125%; }
             #TechNote {
-                color: #90a7b8; font-size: 8.7pt; padding-top: 2px;
-                border-top: 1px solid #233241;
+                color: #8ea4b5; font-size: 8.6pt; padding-top: 3px;
+                border-top: 1px solid #243444;
             }
             #SceneBadge {
-                color: #c8d6e2; background: rgba(12, 18, 25, 185);
-                border: 1px solid #2a3b4c; border-radius: 8px;
-                padding: 5px 8px; font-size: 8.5pt; font-weight: 700;
+                color: #a9bbc8; background: rgba(13, 20, 28, 150);
+                border: 1px solid #263746; border-radius: 7px;
+                padding: 3px 7px; font-size: 8pt; font-weight: 600;
             }
             #InfoCard, #HelpBox, #ControlRow, #MetricBox {
-                background: #121d27; border: 1px solid #223140; border-radius: 7px;
+                background: #141f2a; border: 1px solid #253545; border-radius: 7px;
             }
             #MetricBox, #FormulaText {
-                padding: 7px; color: #cfe8ff; background: #0d141c; border: 1px solid #253546; border-radius: 8px;
+                padding: 7px; color: #cfe8ff; background: #0f161f; border: 1px solid #253546; border-radius: 8px;
             }
             #ErrorBox {
                 color: #ffb3b8; background: #27151a; border: 1px solid #63303b; border-radius: 8px; padding: 14px;
             }
             QPushButton {
-                background: #1a2633; color: #eaf0f6; border: 1px solid #2e4254; border-radius: 7px; padding: 5px 8px;
+                background: #1b2835; color: #edf3f8; border: 1px solid #304355; border-radius: 7px; padding: 5px 8px;
                 min-height: 22px;
             }
-            QPushButton:hover { background: #233345; border-color: #436176; }
-            QPushButton:pressed { background: #16212c; }
-            QPushButton#ModeButton { text-align: left; padding: 7px 8px; }
+            QPushButton:hover { background: #243545; border-color: #486477; }
+            QPushButton:pressed { background: #17222d; }
+            QPushButton#ModeButton { text-align: left; padding: 6px 8px; line-height: 120%; }
             QPushButton#ModeButton:checked {
-                background: #26394b; border-color: #ff8a3d; color: #ffffff;
+                background: #263849; border-color: #ff8a3d; color: #ffffff;
                 font-weight: 700;
             }
             QPushButton#ToolbarButton { min-width: 76px; }
+            QPushButton#SecondaryToolbarButton {
+                min-width: 92px; background: #162230; color: #cbd8e3; border-color: #2a3c4c;
+            }
+            QPushButton#SecondaryToolbarButton:hover { background: #1e2c3a; color: #edf3f8; border-color: #3b5366; }
             QComboBox {
-                background: #0d141c; color: #eaf0f6; border: 1px solid #2d4153; border-radius: 6px; padding: 5px 8px;
+                background: #0f161f; color: #edf3f8; border: 1px solid #2d4153; border-radius: 6px; padding: 5px 8px;
                 min-height: 22px;
             }
-            QComboBox QAbstractItemView { background: #101821; color: #eaf0f6; selection-background-color: #25384a; }
-            QSlider::groove:horizontal { height: 6px; background: #263645; border-radius: 3px; }
+            QComboBox QAbstractItemView { background: #111922; color: #edf3f8; selection-background-color: #25384a; }
+            QSlider::groove:horizontal { height: 6px; background: #2a3a48; border-radius: 3px; }
             QSlider::sub-page:horizontal { background: #ff8a3d; border-radius: 3px; }
             QSlider::handle:horizontal {
                 width: 16px; height: 16px; margin: -6px 0; background: #f5f8fb;
                 border: 2px solid #ff8a3d; border-radius: 8px;
             }
             QCheckBox {
-                background: #121d27; border: 1px solid #263645; border-radius: 7px; padding: 6px;
+                background: #141f2a; border: 1px solid #253545; border-radius: 7px; padding: 6px;
             }
             QProgressBar {
-                background: #263645; border: 0; border-radius: 4px; height: 8px;
+                background: #2a3a48; border: 0; border-radius: 4px; height: 8px;
             }
             QSplitter::handle { background: #090d13; }
             #ParameterPanel, #ParameterViewport { background: transparent; }
             QScrollArea { background: transparent; border: none; }
             QScrollBar:vertical { background: #0c1219; width: 10px; margin: 2px; border-radius: 5px; }
-            QScrollBar::handle:vertical { background: #2b3c4d; min-height: 36px; border-radius: 5px; }
+            QScrollBar::handle:vertical { background: #314456; min-height: 36px; border-radius: 5px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             #Separator { color: #263645; background: #263645; }
-            #ValueLabel { color: #ffbc84; font-weight: 700; }
+            #ValueLabel { color: #f5b17a; font-weight: 700; }
             """
         )
 
 
+def configure_open_gl_surface():
+    surface_format = QSurfaceFormat()
+    surface_format.setSamples(8)
+    surface_format.setDepthBufferSize(24)
+    surface_format.setStencilBufferSize(8)
+    surface_format.setSwapBehavior(QSurfaceFormat.DoubleBuffer)
+    QSurfaceFormat.setDefaultFormat(surface_format)
+    if pg is not None:
+        pg.setConfigOptions(antialias=True)
+
+
 def main():
+    configure_open_gl_surface()
     app = QApplication(sys.argv)
     app.setApplicationName("FDM Parametreleri Görselleştiricisi")
     window = MainWindow()
