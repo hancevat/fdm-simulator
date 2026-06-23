@@ -45,7 +45,7 @@ except Exception as exc:  # pragma: no cover - dependency fallback
     PGVector = None
     GL_IMPORT_ERROR = exc
 
-
+# modların iç keyleri sabit kalsın, ekranda görünen isim ayrı iş
 MODE_KEYS = ("intro", "overhang", "pressure", "input", "retraction", "flow")
 DEFAULT_TERM_MODE = "Açıklamalı"
 TERM_MODE_LABELS = {
@@ -70,6 +70,7 @@ TERM_MODE_LABELS = {
 MODES = [(mode, TERM_MODE_LABELS[DEFAULT_TERM_MODE][mode]) for mode in MODE_KEYS]
 MODE_LABELS = dict(MODES)
 
+# sol panel dar, bazı isimleri burada elle iki satıra kırıyoruz
 MODE_BUTTON_BREAKS = {
     "Açıklamalı": {
         "overhang": "Köprüleme /\nSoğutma",
@@ -84,6 +85,7 @@ MODE_BUTTON_BREAKS = {
     },
 }
 
+# içeride custom kalsın, kullanıcıya özel görünsün yeter
 PRESET_DISPLAY_NAMES = {"PLA": "PLA", "PETG": "PETG", "ABS": "ABS", "Custom": "Özel"}
 PRESET_DISPLAY_TO_VALUE = {display: value for value, display in PRESET_DISPLAY_NAMES.items()}
 
@@ -104,6 +106,7 @@ def preset_display_name(preset_name):
 def preset_internal_name(display_name):
     return PRESET_DISPLAY_TO_VALUE.get(display_name, display_name)
 
+# ilk açılış değerleri, preset seçilince bunların üstüne yazılıyor
 DEFAULT_PARAMETERS = {
     "intro": {},
     "overhang": {"angle": 40, "fan": 70, "speed": 55, "support": False},
@@ -182,6 +185,7 @@ def smoothstep(value):
     return value * value * (3.0 - 2.0 * value)
 
 
+# bridge tarafında sahne ve risk aynı küçük paketten beslensin diye
 def bridge_scene_config(params):
     span_mm = float(params.get("angle", 40))
     fan = float(params.get("fan", 70))
@@ -365,6 +369,7 @@ class PrintSimulationEngine:
         return (self.state.active_mode, tuple(sorted(params.items())))
 
     def ensure_current(self):
+        # parametre değişmediyse katmanları tekrar üretmeye gerek yok
         signature = self.params_signature()
         if signature != self.signature:
             self.mode = self.state.active_mode
@@ -384,6 +389,7 @@ class PrintSimulationEngine:
         self.ensure_current()
 
     def flatten_segments(self):
+        # animasyon her küçük çizgiyi sırayla geziyor, süreleri burada çıkıyor
         self.flat_segments = []
         self.segment_layer_indices = []
         for layer in self.layers:
@@ -425,6 +431,7 @@ class PrintSimulationEngine:
         self.nozzle_position = self.active_segment.point_at(self.active_segment_progress)
 
     def generate_layers(self, mode, params):
+        # mod keyleri burada dağılıyor, görünen isimlerle işi yok
         if mode == "overhang":
             return self.generate_overhang(params)
         if mode == "pressure":
@@ -473,6 +480,7 @@ class PrintSimulationEngine:
         return layers
 
     def generate_overhang(self, params):
+        # köprü çizgileri alt kulelerin üstüne katman katman kuruluyor
         config = bridge_scene_config(params)
         risk = config["sag_strength"]
         layers = []
@@ -521,6 +529,7 @@ class PrintSimulationEngine:
         return layers
 
     def generate_pressure(self, params):
+        # pa hatasını köşelerde şişme ya da incelme olarak işaretliyoruz
         result = FDMModel.pressure_advance_quality(params)
         low = result["low_pa_defect"]
         high = result["high_pa_defect"]
@@ -558,6 +567,7 @@ class PrintSimulationEngine:
         return layers
 
     def generate_input_shaping(self, params):
+        # gerçek titreşim simülasyonu değil, okunur bir ringing dalgası
         acceleration = float(params.get("acceleration", 3500))
         frequency = float(params.get("frequency", 45))
         speed = float(params.get("speed", 100))
@@ -584,6 +594,7 @@ class PrintSimulationEngine:
         return layers
 
     def generate_retraction(self, params):
+        # iki kule arası boşta hareket, ipliklenme için iyi bir sahne veriyor
         result = FDMModel.retraction_stringing_risk(params)
         stringing = result["stringing_risk"]
         gap = result["restart_gap_risk"]
@@ -665,6 +676,7 @@ class PrintSimulationEngine:
         return layers
 
     def generate_flow(self, params):
+        # flow limiti aşılırsa çizgi incelmesi ve boşluk buradan besleniyor
         result = FDMModel.volumetric_flow_risk(params)
         risk = result["risk"]
         ratio = result["ratio"]
@@ -708,6 +720,7 @@ class FDMModel:
 
     @staticmethod
     def pressure_advance_quality(params):
+        # burada kalite skoru var, risk skoru gibi ters okunmasın
         pa = clamp(float(params.get("pa", 0.05)), PA_SLIDER_MIN, PA_SLIDER_MAX)
         extruder = params.get("extruder", "Direct Drive")
         speed = float(params.get("speed", 80))
@@ -738,6 +751,7 @@ class FDMModel:
 
     @staticmethod
     def input_shaping_risk(params):
+        # shaper kapalıysa risk tam geliyor, seçilince çarpanla kısılıyor
         acceleration = float(params.get("acceleration", 3500))
         frequency = float(params.get("frequency", 45))
         speed = float(params.get("speed", 100))
@@ -750,6 +764,7 @@ class FDMModel:
 
     @staticmethod
     def retraction_stringing_risk(params):
+        # az geri çekme ipliklenme, fazla geri çekme restart boşluğu gibi düşün
         retraction = float(params.get("retraction", 1.0))
         temperature = float(params.get("temperature", 205))
         travel_speed = float(params.get("travel_speed", 160))
@@ -779,6 +794,7 @@ class FDMModel:
 
     @staticmethod
     def volumetric_flow_risk(params):
+        # debi hesabı basit kalsın, nozzle sadece yorum tarafına yardım ediyor
         layer_height = float(params.get("layer_height", 0.20))
         line_width = float(params.get("line_width", 0.45))
         print_speed = float(params.get("print_speed", 70))
@@ -803,6 +819,7 @@ class FDMModel:
 
     @staticmethod
     def score_for_mode(mode, params):
+        # pressure kalite, diğer modlar risk gibi okunuyor
         if mode == "pressure":
             quality = FDMModel.pressure_advance_quality(params)["quality"]
             return "Kalite Skoru", quality, int(round(quality * 100)), False
@@ -840,6 +857,7 @@ class FDMModel:
 
     @staticmethod
     def formatted_parameter_lines(mode, params):
+        # rapora ham değişken adı basmayalım diye küçük çeviri tablosu
         specs = {
             "overhang": [
                 ("angle", "Köprü açıklığı", "mm"),
@@ -1141,6 +1159,7 @@ class FDMModel:
 
     @staticmethod
     def report_copy_text(mode, params, term_mode=DEFAULT_TERM_MODE):
+        # kopyalanan rapor da seçili terim modunu takip etsin
         score_label, _, score, is_risk = FDMModel.score_for_mode(mode, params)
         lines = [
             "FDM Parametreleri Görselleştiricisi",
@@ -1172,6 +1191,7 @@ class FDMModel:
 
 class SimulationState:
     def __init__(self):
+        # ekranda seçili olan temel şeyleri burada tutuyoruz
         self.active_mode = "intro"
         self.running = True
         self.animation_time = 0.0
@@ -1186,6 +1206,7 @@ class SimulationState:
 
     def set_mode(self, mode):
         if mode in MODE_LABELS:
+            # mod değişince animasyon başa dönsün, ayarlar olduğu gibi kalsın
             self.active_mode = mode
             self.animation_time = 0.0
 
@@ -1199,6 +1220,7 @@ class SimulationState:
     def apply_preset(self, preset_name):
         self.selected_preset = preset_name
         if preset_name == "Custom":
+            # özel seçimi sadece etiket, değerleri ezmeye gerek yok
             return
         preset = PRESET_PARAMETERS.get(preset_name, {})
         for mode, values in preset.items():
@@ -1294,6 +1316,7 @@ class GLSceneWidget(QWidget):
         self.add_line([(-x, -y, z), (x, -y, z), (x, y, z), (-x, y, z), (-x, -y, z)], "#607384", 1.0, 0.85)
 
     def scene_point(self, point):
+        # model tarafı küçük sayılarla rahat, sahnede okunması için büyütüyoruz
         point = np.asarray(point, dtype=float)
         return np.asarray((point[0] * PART_SCALE, point[1] * PART_SCALE, point[2] * Z_VISUAL_SCALE), dtype=float)
 
@@ -1345,6 +1368,7 @@ class GLSceneWidget(QWidget):
         return float(np.linalg.norm(previous_end - current_start)) < 0.10
 
     def collect_bead_runs(self, segments):
+        # bağlı filament parçalarını tek mesh gibi çizmek daha temiz duruyor
         runs = []
         current = []
         for segment in segments:
@@ -1392,6 +1416,7 @@ class GLSceneWidget(QWidget):
         return distances
 
     def deterministic_noise(self, index, seed=0):
+        # random yok, aynı ayarda aynı ufak pürüzler görünsün
         value = math.sin((index + 1) * 12.9898 + (seed + 1) * 78.233) * 43758.5453
         return value - math.floor(value)
 
@@ -1505,6 +1530,7 @@ class GLSceneWidget(QWidget):
         return modifiers
 
     def apply_width_profile(self, samples, total):
+        # köşe, flow ve retraction izleri aynı kalınlık listesine işleniyor
         modifiers = np.ones(len(samples), dtype=float)
         modifiers = self.apply_corner_blob_profile(modifiers, samples)
         modifiers = self.apply_underextrusion_profile(modifiers, samples)
@@ -1512,6 +1538,7 @@ class GLSceneWidget(QWidget):
         return np.clip(modifiers, 0.18, 1.95)
 
     def apply_gap_profile(self, samples, total):
+        # boşlukları ayrı obje değil, mesh üzerinde görünmeyen aralık gibi tutuyoruz
         gaps = []
         if total <= 0 or not samples:
             return gaps
@@ -1715,6 +1742,7 @@ class GLSceneWidget(QWidget):
         return any(start <= value <= end for start, end in gap_ranges)
 
     def create_extrusion_bead_mesh(self, path_points, width, height, color, width_modifiers=None, gap_ranges=None, z_offsets=None, alpha=1.0):
+        # filament hattı kutu gibi değil, biraz yuvarlak ve yumuşak görünsün
         if gl is None:
             return None
         points = [np.asarray(point, dtype=float) for point in path_points]
@@ -2033,7 +2061,7 @@ class GLSceneWidget(QWidget):
         ns = self.toolhead_scale()
         x, y, z = tip
 
-        # Low-poly toolhead: a few readable parts instead of a CAD-heavy model.
+        # cad gibi kasmayalım, uzaktan okunan sade toolhead yeter
         self.add_box(center=(x, y, z + 13.4 * ns), size=(9.2 * ns, 6.3 * ns, 3.6 * ns), color="#46525d", alpha=1.0, edge="#8fa0ad", draw_edges=False)
         self.add_box(center=(x, y, z + 10.7 * ns), size=(6.9 * ns, 4.9 * ns, 1.0 * ns), color="#6d7a84", alpha=1.0, edge="#b7c3cc", draw_edges=False)
         for fin_index in range(4):
@@ -2055,6 +2083,7 @@ class GLSceneWidget(QWidget):
         if fan <= 0.01:
             return
 
+        # hava akışı sahneye değil, nozzle yanındaki fan bloğuna bağlı dursun
         ns = self.toolhead_scale()
         nozzle_tip = self.scene_point(self.engine.nozzle_position) + np.array((0.0, 0.0, self.scene_height(self.engine.visual_segment_height()) * 0.72))
         origin_base = nozzle_tip + np.array((7.1 * ns, -1.6 * ns, 6.2 * ns))
@@ -2127,6 +2156,7 @@ class GLSceneWidget(QWidget):
     def update_scene(self):
         if self.view is None:
             return
+        # her karede sahneyi baştan kuruyoruz, obje birikmesi olmasın
         self.engine.update_progress(self.state.animation_time)
         self.clear_scene()
         self.build_static_scene()
@@ -2159,6 +2189,7 @@ class ParameterPanel(QWidget):
                 widget.deleteLater()
 
     def rebuild(self):
+        # sağ panel komple yenileniyor, çünkü her modun kontrol takımı farklı
         self.clear_layout()
         title = QLabel(mode_label(self.state.active_mode, self.state.term_mode))
         title.setObjectName("ModeTitle")
@@ -2207,6 +2238,7 @@ class ParameterPanel(QWidget):
         return self.state.current_params().get(key, default)
 
     def add_slider(self, label_text, key, min_value, max_value, step, unit, tooltip):
+        # slider değerini direkt state'e yazar, sahne de oradan okur
         frame = QFrame()
         frame.setObjectName("ControlRow")
         frame.setMinimumHeight(50)
@@ -2481,6 +2513,7 @@ class InfoPanel(QWidget):
         return ""
 
     def update_info(self):
+        # alttaki kısa sonuç kartı, uzun rapordan ayrı ve hızlı okunacak yer
         mode = self.state.active_mode
         params = self.state.current_params()
         score_label, normalized, score, is_risk = FDMModel.score_for_mode(mode, params)
@@ -2551,6 +2584,7 @@ class MainWindow(QMainWindow):
         return frame
 
     def build_left_panel(self):
+        # sol taraf sabit kalsın, uzun isimleri buton içinde toparlıyoruz
         panel = QFrame()
         panel.setObjectName("SidePanel")
         panel.setFixedWidth(198)
@@ -2702,6 +2736,7 @@ class MainWindow(QMainWindow):
     def set_term_mode(self, term_mode):
         if term_mode not in TERM_MODE_LABELS or term_mode == self.state.term_mode:
             return
+        # sadece yazılar değişsin, aktif mod ve animasyonla oynamıyoruz
         self.state.term_mode = term_mode
         self.refresh_mode_labels()
         self.parameter_panel.rebuild()
@@ -2730,6 +2765,7 @@ class MainWindow(QMainWindow):
         self.speed_value.setText(f"{self.state.animation_speed:.2f}x")
 
     def apply_preset(self, preset_name):
+        # combo ekranda özel der, state tarafında custom diye gezer
         preset_name = preset_internal_name(preset_name)
         self._updating_preset = True
         self.state.apply_preset(preset_name)
@@ -2742,6 +2778,7 @@ class MainWindow(QMainWindow):
 
     def parameters_changed(self):
         if not self._updating_preset and self.state.selected_preset != "Custom":
+            # elle oynandıysa artık hazır preset değil
             self.state.selected_preset = "Custom"
             self.preset_combo.blockSignals(True)
             self.preset_combo.setCurrentText(preset_display_name("Custom"))
@@ -2750,6 +2787,7 @@ class MainWindow(QMainWindow):
         self.refresh_panels(rebuild_parameters=False)
 
     def refresh_panels(self, rebuild_parameters=False):
+        # parametre paneli pahalı değil ama gerekmiyorsa yeniden kurmuyoruz
         if rebuild_parameters:
             self.parameter_panel.rebuild()
         self.info_panel.update_info()
